@@ -489,6 +489,177 @@ def _lm_precision_context(fp8: bool):
             yield
 
 
+class FourierDTEncoder(nn.Module):
+    """Fourier features for MD timestep conditioning.
+
+    Expects dt in seconds and uses log(dt in ns), which keeps the 1-500 ns
+    training range numerically well-scaled.
+    """
+
+    def __init__(
+        self,
+        d_pair: int,
+        num_frequencies: int = 16,
+        max_dt_ns: float = 500.0,
+    ) -> None:
+        super().__init__()
+        frequencies = torch.exp(
+            torch.linspace(math.log(1.0), math.log(16.0), num_frequencies)
+        )
+        self.register_buffer("frequencies", frequencies)
+        self.max_dt_ns = float(max_dt_ns)
+
+        input_dim = 2 * num_frequencies + 2
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, d_pair),
+            nn.SiLU(),
+            nn.Linear(d_pair, d_pair),
+        )
+        self.zero_init_output()
+
+    def zero_init_output(self) -> None:
+        out = self.net[-1]
+        assert isinstance(out, nn.Linear)
+        nn.init.zeros_(out.weight)
+        nn.init.zeros_(out.bias)
+
+    def forward(self, dt: Tensor) -> Tensor:
+        if dt.ndim == 1:
+            dt = dt[:, None]
+        dt_ns = (dt.float() / 1e-9).clamp_min(1e-6)
+        log_dt = torch.log(dt_ns)
+        angles = log_dt * self.frequencies.to(device=dt.device, dtype=log_dt.dtype)
+        scaled_dt = (dt_ns / self.max_dt_ns).clamp(max=10.0)
+        features = torch.cat(
+            [log_dt, scaled_dt, torch.sin(angles), torch.cos(angles)], dim=-1
+        )
+        return self.net(features)
+
+
+class CAFramePairEncoder(nn.Module):
+    """Encode current-frame C-alpha pair distances as pair features."""
+
+    def __init__(
+        self,
+        d_pair: int,
+        num_rbf: int = 32,
+        rbf_min: float = 2.0,
+        rbf_max: float = 40.0,
+        rbf_width: float = 2.0,
+    ) -> None:
+        super().__init__()
+        self.register_buffer("rbf_centers", torch.linspace(rbf_min, rbf_max, num_rbf))
+        self.rbf_width = float(rbf_width)
+
+        self.proj = nn.Sequential(
+            nn.LayerNorm(num_rbf),
+            nn.Linear(num_rbf, d_pair),
+            nn.SiLU(),
+            nn.Linear(d_pair, d_pair),
+        )
+        self.zero_init_output()
+
+    def zero_init_output(self) -> None:
+        out = self.proj[-1]
+        assert isinstance(out, nn.Linear)
+        nn.init.zeros_(out.weight)
+        nn.init.zeros_(out.bias)
+
+    def forward(self, ca_xyz: Tensor, token_attention_mask: Tensor) -> Tensor:
+        distances = torch.cdist(ca_xyz.float(), ca_xyz.float())
+        centers = self.rbf_centers.to(device=ca_xyz.device, dtype=distances.dtype)
+        rbf = torch.exp(-((distances[..., None] - centers) / self.rbf_width).square())
+        z = self.proj(rbf)
+
+        pair_mask = token_attention_mask[:, :, None] & token_attention_mask[:, None, :]
+        return z * pair_mask[..., None].to(dtype=z.dtype)
+
+
+class MDConditioning(nn.Module):
+    """Build an lm_z-shaped pair bias from current MD frame and timestep."""
+
+    def __init__(self, d_pair: int) -> None:
+        super().__init__()
+        self.ca_pair_encoder = CAFramePairEncoder(d_pair=d_pair)
+        self.dt_encoder = FourierDTEncoder(d_pair=d_pair)
+        self.register_buffer(
+            "ca_atom_name",
+            torch.tensor([ord("C") - 32, ord("A") - 32, 0, 0], dtype=torch.long),
+        )
+
+    def zero_init_output(self) -> None:
+        self.ca_pair_encoder.zero_init_output()
+        self.dt_encoder.zero_init_output()
+
+    def _gather_ca_coords(
+        self,
+        x_t: Tensor,
+        atom_to_token: Tensor,
+        ref_atom_name_chars: Tensor,
+        atom_attention_mask: Tensor,
+        token_attention_mask: Tensor,
+    ) -> Tensor:
+        if ref_atom_name_chars.ndim == 4:
+            ref_atom_name_chars = ref_atom_name_chars.argmax(dim=-1)
+
+        bsz, n_atoms, _ = x_t.shape
+        n_tokens = token_attention_mask.shape[1]
+        if atom_to_token.shape[:2] != (bsz, n_atoms):
+            raise ValueError(
+                "atom_to_token must have shape [B, A] matching x_t [B, A, 3]"
+            )
+
+        ca_name = self.ca_atom_name.to(
+            device=ref_atom_name_chars.device, dtype=ref_atom_name_chars.dtype
+        )
+        ca_mask = (ref_atom_name_chars == ca_name).all(dim=-1)
+        ca_mask = ca_mask & atom_attention_mask.bool()
+
+        token_idx = atom_to_token.long().clamp(min=0, max=n_tokens - 1)
+        coords = torch.zeros(
+            bsz, n_tokens, 3, device=x_t.device, dtype=x_t.dtype
+        )
+        counts = torch.zeros(
+            bsz, n_tokens, device=x_t.device, dtype=x_t.dtype
+        )
+
+        coords.scatter_add_(
+            1,
+            token_idx.unsqueeze(-1).expand(-1, -1, 3),
+            x_t * ca_mask.unsqueeze(-1).to(device=x_t.device, dtype=x_t.dtype),
+        )
+        counts.scatter_add_(1, token_idx, ca_mask.to(device=x_t.device, dtype=x_t.dtype))
+
+        missing_ca = token_attention_mask.bool() & (counts == 0)
+        if missing_ca.any():
+            raise ValueError("x_t MD conditioning requires one CA atom per valid token")
+
+        return coords / counts.clamp_min(1.0).unsqueeze(-1)
+
+    def forward(
+        self,
+        x_t: Tensor,
+        dt: Tensor,
+        atom_to_token: Tensor,
+        ref_atom_name_chars: Tensor,
+        atom_attention_mask: Tensor,
+        token_attention_mask: Tensor,
+    ) -> Tensor:
+        ca_xyz = self._gather_ca_coords(
+            x_t=x_t,
+            atom_to_token=atom_to_token,
+            ref_atom_name_chars=ref_atom_name_chars,
+            atom_attention_mask=atom_attention_mask,
+            token_attention_mask=token_attention_mask,
+        )
+        z_xt = self.ca_pair_encoder(ca_xyz, token_attention_mask)
+        z_dt = self.dt_encoder(dt)[:, None, None, :]
+        z = z_xt + z_dt.to(dtype=z_xt.dtype)
+        pair_mask = token_attention_mask[:, :, None] & token_attention_mask[:, None, :]
+        return z * pair_mask[..., None].to(dtype=z.dtype)
+
+
 class ESMFold2Model(PreTrainedModel):
     """ESMFold2 — all-atom structure prediction with an ESMC PLM backbone.
 
@@ -534,6 +705,7 @@ class ESMFold2Model(PreTrainedModel):
         self.language_model = LanguageModelShim(
             d_z=d_pair, d_model=config.lm_d_model, num_layers=config.lm_num_layers
         )
+        self.md_conditioning = MDConditioning(d_pair=d_pair)
         self._esmc: nn.Module | None = None
         self._esmc_fp8: bool = False  # set by load_esmc(fp8=True)
 
@@ -585,6 +757,8 @@ class ESMFold2Model(PreTrainedModel):
             )
 
         self.post_init()
+        # Keep pretrained behavior unchanged until MD conditioning learns a signal.
+        self.md_conditioning.zero_init_output()
 
     def load_esmc(self, esmc_model_path: str, precision: str = "bf16") -> None:
         """Load the ESMC LM.
@@ -847,8 +1021,7 @@ class ESMFold2Model(PreTrainedModel):
 
         return z
 
-    @torch.inference_mode()
-    def forward(
+    def _forward_impl(
         self,
         token_index: Tensor,
         residue_index: Tensor,
@@ -874,6 +1047,8 @@ class ESMFold2Model(PreTrainedModel):
         msa_attention_mask: Tensor | None = None,
         input_ids: Tensor | None = None,
         lm_hidden_states: Tensor | None = None,
+        x_t: Tensor | None = None,
+        dt: Tensor | None = None,
         num_loops: int | None = None,
         num_diffusion_samples: int | None = None,
         num_sampling_steps: int | None = None,
@@ -881,6 +1056,11 @@ class ESMFold2Model(PreTrainedModel):
         msa_max_depth: int = 1024,
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
+        target_atom_coords: Tensor | None = None,
+        target_atom_mask: Tensor | None = None,
+        compute_distogram: bool = True,
+        compute_confidence: bool = True,
+        train_structure: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         tok_mask = token_attention_mask
@@ -983,6 +1163,19 @@ class ESMFold2Model(PreTrainedModel):
                 lm_z = self.language_model(lm_hidden_states.detach())
             del lm_hidden_states
 
+            if (x_t is None) != (dt is None):
+                raise ValueError("x_t and dt must be provided together")
+            if x_t is not None and dt is not None:
+                md_z = self.md_conditioning(
+                    x_t=x_t,
+                    dt=dt,
+                    atom_to_token=atom_to_token,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                    atom_attention_mask=atm_mask,
+                    token_attention_mask=tok_mask,
+                )
+                lm_z = md_z if lm_z is None else lm_z + md_z.to(dtype=lm_z.dtype)
+
             pair_mask = tok_mask[:, :, None].float() * tok_mask[:, None, :].float()
 
             z = self._init_pair_state(z_init)
@@ -1027,58 +1220,257 @@ class ESMFold2Model(PreTrainedModel):
             z = self.parcae_coda(z, pair_attention_mask=pair_mask)
 
             z = z.float()
-        distogram_logits = self.distogram_head(z + z.transpose(-2, -3))
+        output: dict[str, Tensor] = {}
+        if compute_distogram:
+            output["distogram_logits"] = self.distogram_head(z + z.transpose(-2, -3))
 
-        structure_output = self.structure_head.sample(
-            z_trunk=z,
-            s_inputs=x_inputs,
-            s_trunk=None,
-            relative_position_encoding=relative_position_encoding,
-            ref_pos=ref_pos,
-            ref_charge=ref_charge,
-            ref_mask=atm_mask,
-            ref_element=ref_element_oh,
-            ref_atom_name_chars=ref_atom_name_chars_oh,
-            ref_space_uid=ref_space_uid,
-            tok_idx=atom_to_token,
-            asym_id=asym_id,
-            residue_index=residue_index,
-            entity_id=entity_id,
-            token_index=token_index,
-            sym_id=sym_id,
-            token_attention_mask=tok_mask,
-            num_diffusion_samples=n_samples,
-            num_sampling_steps=num_sampling_steps,
-            return_atom_repr=False,
-            denoising_early_exit_rmsd=None,
-        )
+        sample_coords: Tensor | None = None
+        if train_structure and (
+            target_atom_coords is not None or target_atom_mask is not None
+        ):
+            if target_atom_coords is None or target_atom_mask is None:
+                raise ValueError(
+                    "target_atom_coords and target_atom_mask must be provided together"
+                )
+            diffusion_output = self.structure_head.train_denoising(
+                z_trunk=z,
+                s_inputs=x_inputs,
+                s_trunk=None,
+                relative_position_encoding=relative_position_encoding,
+                ref_pos=ref_pos,
+                ref_charge=ref_charge,
+                ref_mask=atm_mask,
+                ref_element=ref_element_oh,
+                ref_atom_name_chars=ref_atom_name_chars_oh,
+                ref_space_uid=ref_space_uid,
+                tok_idx=atom_to_token,
+                asym_id=asym_id,
+                residue_index=residue_index,
+                entity_id=entity_id,
+                token_index=token_index,
+                sym_id=sym_id,
+                target_atom_coords=target_atom_coords,
+                target_atom_mask=target_atom_mask,
+                token_attention_mask=tok_mask,
+            )
+            output.update(diffusion_output)
+            sample_coords = diffusion_output["sample_atom_coords"]
+        else:
+            sample_fn = (
+                self.structure_head.sample_train
+                if train_structure
+                else self.structure_head.sample
+            )
+            structure_output = sample_fn(
+                z_trunk=z,
+                s_inputs=x_inputs,
+                s_trunk=None,
+                relative_position_encoding=relative_position_encoding,
+                ref_pos=ref_pos,
+                ref_charge=ref_charge,
+                ref_mask=atm_mask,
+                ref_element=ref_element_oh,
+                ref_atom_name_chars=ref_atom_name_chars_oh,
+                ref_space_uid=ref_space_uid,
+                tok_idx=atom_to_token,
+                asym_id=asym_id,
+                residue_index=residue_index,
+                entity_id=entity_id,
+                token_index=token_index,
+                sym_id=sym_id,
+                token_attention_mask=tok_mask,
+                num_diffusion_samples=n_samples,
+                num_sampling_steps=num_sampling_steps,
+                return_atom_repr=False,
+                denoising_early_exit_rmsd=None,
+            )
 
-        sample_coords = structure_output["sample_atom_coords"]
-        assert sample_coords is not None
-        output: dict[str, Tensor] = {"distogram_logits": distogram_logits}
-        output["sample_atom_coords"] = sample_coords
+            sample_coords = structure_output["sample_atom_coords"]
+            assert sample_coords is not None
+            output["sample_atom_coords"] = sample_coords
 
-        confidence_output = self.confidence_head(
-            s_inputs=x_inputs.detach(),
-            z=z.detach().float(),
-            x_pred=sample_coords.detach(),
-            distogram_atom_idx=disto_idx,
-            token_attention_mask=tok_mask,
-            atom_to_token=atom_to_token,
-            atom_attention_mask=atm_mask,
-            asym_id=asym_id,
-            mol_type=mol_type,
-            num_diffusion_samples=n_samples,
-            relative_position_encoding=relative_position_encoding.detach(),
-            token_bonds_encoding=token_bonds_encoding.detach(),
-        )
-        output.update(confidence_output)
+        if compute_confidence:
+            assert sample_coords is not None
+            confidence_output = self.confidence_head(
+                s_inputs=x_inputs.detach(),
+                z=z.detach().float(),
+                x_pred=sample_coords.detach(),
+                distogram_atom_idx=disto_idx,
+                token_attention_mask=tok_mask,
+                atom_to_token=atom_to_token,
+                atom_attention_mask=atm_mask,
+                asym_id=asym_id,
+                mol_type=mol_type,
+                num_diffusion_samples=n_samples,
+                relative_position_encoding=relative_position_encoding.detach(),
+                token_bonds_encoding=token_bonds_encoding.detach(),
+            )
+            output.update(confidence_output)
         output["atom_pad_mask"] = (
             atm_mask.unsqueeze(0) if atm_mask.dim() == 1 else atm_mask
         )
         output["residue_index"] = residue_index
         output["entity_id"] = entity_id
         return output
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        token_index: Tensor,
+        residue_index: Tensor,
+        asym_id: Tensor,
+        sym_id: Tensor,
+        entity_id: Tensor,
+        mol_type: Tensor,
+        res_type: Tensor,
+        token_bonds: Tensor,
+        token_attention_mask: Tensor,
+        ref_pos: Tensor,
+        ref_element: Tensor,
+        ref_charge: Tensor,
+        ref_atom_name_chars: Tensor,
+        ref_space_uid: Tensor,
+        atom_attention_mask: Tensor,
+        atom_to_token: Tensor,
+        distogram_atom_idx: Tensor,
+        deletion_mean: Tensor | None = None,
+        msa: Tensor | None = None,
+        has_deletion: Tensor | None = None,
+        deletion_value: Tensor | None = None,
+        msa_attention_mask: Tensor | None = None,
+        input_ids: Tensor | None = None,
+        lm_hidden_states: Tensor | None = None,
+        x_t: Tensor | None = None,
+        dt: Tensor | None = None,
+        num_loops: int | None = None,
+        num_diffusion_samples: int | None = None,
+        num_sampling_steps: int | None = None,
+        lm_mask_pct: float | None = None,
+        msa_max_depth: int = 1024,
+        msa_column_mask_rate: float = 0.1,
+        msa_subsample_at_inference: bool = True,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        return self._forward_impl(
+            token_index=token_index,
+            residue_index=residue_index,
+            asym_id=asym_id,
+            sym_id=sym_id,
+            entity_id=entity_id,
+            mol_type=mol_type,
+            res_type=res_type,
+            token_bonds=token_bonds,
+            token_attention_mask=token_attention_mask,
+            ref_pos=ref_pos,
+            ref_element=ref_element,
+            ref_charge=ref_charge,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            atom_attention_mask=atom_attention_mask,
+            atom_to_token=atom_to_token,
+            distogram_atom_idx=distogram_atom_idx,
+            deletion_mean=deletion_mean,
+            msa=msa,
+            has_deletion=has_deletion,
+            deletion_value=deletion_value,
+            msa_attention_mask=msa_attention_mask,
+            input_ids=input_ids,
+            lm_hidden_states=lm_hidden_states,
+            x_t=x_t,
+            dt=dt,
+            num_loops=num_loops,
+            num_diffusion_samples=num_diffusion_samples,
+            num_sampling_steps=num_sampling_steps,
+            lm_mask_pct=lm_mask_pct,
+            msa_max_depth=msa_max_depth,
+            msa_column_mask_rate=msa_column_mask_rate,
+            msa_subsample_at_inference=msa_subsample_at_inference,
+            compute_distogram=True,
+            compute_confidence=True,
+            train_structure=False,
+            **kwargs,
+        )
+
+    def forward_train(
+        self,
+        token_index: Tensor,
+        residue_index: Tensor,
+        asym_id: Tensor,
+        sym_id: Tensor,
+        entity_id: Tensor,
+        mol_type: Tensor,
+        res_type: Tensor,
+        token_bonds: Tensor,
+        token_attention_mask: Tensor,
+        ref_pos: Tensor,
+        ref_element: Tensor,
+        ref_charge: Tensor,
+        ref_atom_name_chars: Tensor,
+        ref_space_uid: Tensor,
+        atom_attention_mask: Tensor,
+        atom_to_token: Tensor,
+        distogram_atom_idx: Tensor,
+        deletion_mean: Tensor | None = None,
+        msa: Tensor | None = None,
+        has_deletion: Tensor | None = None,
+        deletion_value: Tensor | None = None,
+        msa_attention_mask: Tensor | None = None,
+        input_ids: Tensor | None = None,
+        lm_hidden_states: Tensor | None = None,
+        x_t: Tensor | None = None,
+        dt: Tensor | None = None,
+        target_atom_coords: Tensor | None = None,
+        target_atom_mask: Tensor | None = None,
+        num_loops: int | None = None,
+        num_diffusion_samples: int | None = 1,
+        num_sampling_steps: int | None = None,
+        lm_mask_pct: float | None = None,
+        msa_max_depth: int = 1024,
+        msa_column_mask_rate: float = 0.1,
+        msa_subsample_at_inference: bool = True,
+        **kwargs,
+    ) -> dict[str, Tensor]:
+        return self._forward_impl(
+            token_index=token_index,
+            residue_index=residue_index,
+            asym_id=asym_id,
+            sym_id=sym_id,
+            entity_id=entity_id,
+            mol_type=mol_type,
+            res_type=res_type,
+            token_bonds=token_bonds,
+            token_attention_mask=token_attention_mask,
+            ref_pos=ref_pos,
+            ref_element=ref_element,
+            ref_charge=ref_charge,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            atom_attention_mask=atom_attention_mask,
+            atom_to_token=atom_to_token,
+            distogram_atom_idx=distogram_atom_idx,
+            deletion_mean=deletion_mean,
+            msa=msa,
+            has_deletion=has_deletion,
+            deletion_value=deletion_value,
+            msa_attention_mask=msa_attention_mask,
+            input_ids=input_ids,
+            lm_hidden_states=lm_hidden_states,
+            x_t=x_t,
+            dt=dt,
+            num_loops=num_loops,
+            num_diffusion_samples=num_diffusion_samples,
+            num_sampling_steps=num_sampling_steps,
+            lm_mask_pct=lm_mask_pct,
+            msa_max_depth=msa_max_depth,
+            msa_column_mask_rate=msa_column_mask_rate,
+            msa_subsample_at_inference=msa_subsample_at_inference,
+            target_atom_coords=target_atom_coords,
+            target_atom_mask=target_atom_mask,
+            compute_distogram=False,
+            compute_confidence=False,
+            train_structure=True,
+            **kwargs,
+        )
 
     @torch.no_grad()
     def infer_protein(self, seq: str, **forward_kwargs) -> dict:

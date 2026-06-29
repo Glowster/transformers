@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import random
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 from typing import cast
 
 import numpy as np
@@ -1664,6 +1664,8 @@ class DiffusionStructureHead(nn.Module):
         self.inference_s_min = sh.inference_s_min
         self.inference_p = sh.inference_p
         self.inference_num_steps = sh.inference_num_steps
+        self.train_noise_log_mean = sh.train_noise_log_mean
+        self.train_noise_log_std = sh.train_noise_log_std
 
     def set_kernel_backend(self, backend: str | None) -> None:
         self.diffusion_module.set_kernel_backend(backend)
@@ -1671,6 +1673,106 @@ class DiffusionStructureHead(nn.Module):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def train_denoising(
+        self,
+        z_trunk: Tensor,
+        s_inputs: Tensor,
+        s_trunk: Tensor | None,
+        relative_position_encoding: Tensor,
+        ref_pos: Tensor,
+        ref_charge: Tensor,
+        ref_mask: Tensor,
+        ref_element: Tensor,
+        ref_atom_name_chars: Tensor,
+        ref_space_uid: Tensor,
+        tok_idx: Tensor,
+        asym_id: Tensor,
+        residue_index: Tensor,
+        entity_id: Tensor,
+        token_index: Tensor,
+        sym_id: Tensor,
+        target_atom_coords: Tensor,
+        target_atom_mask: Tensor,
+        token_attention_mask: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Single-noise-level denoising objective for diffusion training."""
+        if target_atom_coords.shape != ref_pos.shape:
+            raise ValueError(
+                "target_atom_coords must match ref_pos shape for diffusion training; "
+                f"got {tuple(target_atom_coords.shape)} and {tuple(ref_pos.shape)}"
+            )
+        if target_atom_mask.shape != ref_mask.shape:
+            raise ValueError(
+                "target_atom_mask must match ref_mask shape for diffusion training; "
+                f"got {tuple(target_atom_mask.shape)} and {tuple(ref_mask.shape)}"
+            )
+
+        train_atom_mask = target_atom_mask.to(device=ref_pos.device).bool()
+        train_atom_mask = train_atom_mask & ref_mask.bool()
+        train_mask_f = train_atom_mask.float()
+        target_coords = target_atom_coords.to(device=ref_pos.device, dtype=torch.float32)
+
+        target_aug, _ = self._center_random_augmentation(target_coords, train_mask_f)
+        target_aug = target_aug * train_mask_f.unsqueeze(-1)
+
+        sigma = self.sigma_data * torch.exp(
+            float(self.train_noise_log_mean)
+            + float(self.train_noise_log_std)
+            * torch.randn(
+                target_aug.shape[0], device=target_aug.device, dtype=torch.float32
+            )
+        )
+        x_noisy = target_aug + sigma[:, None, None] * torch.randn_like(target_aug)
+        x_noisy = x_noisy * train_mask_f.unsqueeze(-1)
+
+        diffusion_output = self.diffusion_module(
+            x_noisy=x_noisy,
+            t_hat=sigma,
+            ref_pos=ref_pos,
+            ref_charge=ref_charge,
+            ref_mask=train_atom_mask,
+            ref_element=ref_element,
+            ref_atom_name_chars=ref_atom_name_chars,
+            ref_space_uid=ref_space_uid,
+            tok_idx=tok_idx,
+            s_inputs=s_inputs,
+            s_trunk=s_trunk,
+            z_trunk=z_trunk,
+            relative_position_encoding=relative_position_encoding,
+            asym_id=asym_id,
+            residue_index=residue_index,
+            entity_id=entity_id,
+            token_index=token_index,
+            sym_id=sym_id,
+            token_attention_mask=token_attention_mask,
+            num_diffusion_samples=1,
+            return_token_repr=False,
+            return_atom_repr=False,
+        )
+
+        x_denoised = diffusion_output["x_denoised"]
+        assert x_denoised is not None
+        sq = (x_denoised.float() - target_aug.float()).square().sum(dim=-1)
+        noisy_sq = (x_noisy.float() - target_aug.float()).square().sum(dim=-1)
+        denom = train_mask_f.sum().clamp_min(1.0)
+        loss = (sq * train_mask_f).sum() / denom
+        noisy_mse = (noisy_sq * train_mask_f).sum() / denom
+
+        return {
+            "loss": loss,
+            "x_pred": x_denoised,
+            "sample_atom_coords": x_denoised,
+            "x_noisy": x_noisy,
+            "target_atom_coords_augmented": target_aug,
+            "target_atom_mask": train_atom_mask,
+            "noise_sigma": sigma,
+            "denoise_mse": loss.detach(),
+            "denoise_rmsd": loss.detach().sqrt(),
+            "noisy_mse": noisy_mse.detach(),
+            "noisy_rmsd": noisy_mse.detach().sqrt(),
+            "noise_sigma_mean": sigma.detach().mean(),
+        }
 
     def inference_noise_schedule(
         self, num_steps: int | None = None, device: torch.device | None = None
@@ -1763,8 +1865,7 @@ class DiffusionStructureHead(nn.Module):
     # Sampling
     # ------------------------------------------------------------------
 
-    @torch.inference_mode()
-    def sample(
+    def _sample_impl(
         self,
         z_trunk: Tensor,
         s_inputs: Tensor,
@@ -1929,6 +2030,15 @@ class DiffusionStructureHead(nn.Module):
         if return_atom_repr:
             result["diff_atom_intermediates"] = diff_atom_intermediates
         return result
+
+    @torch.inference_mode()
+    @wraps(_sample_impl)
+    def sample(self, *args, **kwargs) -> dict[str, Tensor | None]:
+        return self._sample_impl(*args, **kwargs)
+
+    @wraps(_sample_impl)
+    def sample_train(self, *args, **kwargs) -> dict[str, Tensor | None]:
+        return self._sample_impl(*args, **kwargs)
 
 
 # ===========================================================================
