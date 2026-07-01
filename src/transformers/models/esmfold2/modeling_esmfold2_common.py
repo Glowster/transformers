@@ -1695,6 +1695,8 @@ class DiffusionStructureHead(nn.Module):
         target_atom_coords: Tensor,
         target_atom_mask: Tensor,
         token_attention_mask: Tensor | None = None,
+        denoise_sigma: Tensor | float | None = None,
+        denoise_noise: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Single-noise-level denoising objective for diffusion training."""
         if target_atom_coords.shape != ref_pos.shape:
@@ -1716,14 +1718,39 @@ class DiffusionStructureHead(nn.Module):
         target_aug, _ = self._center_random_augmentation(target_coords, train_mask_f)
         target_aug = target_aug * train_mask_f.unsqueeze(-1)
 
-        sigma = self.sigma_data * torch.exp(
-            float(self.train_noise_log_mean)
-            + float(self.train_noise_log_std)
-            * torch.randn(
-                target_aug.shape[0], device=target_aug.device, dtype=torch.float32
+        if denoise_sigma is None:
+            sigma = self.sigma_data * torch.exp(
+                float(self.train_noise_log_mean)
+                + float(self.train_noise_log_std)
+                * torch.randn(
+                    target_aug.shape[0], device=target_aug.device, dtype=torch.float32
+                )
             )
-        )
-        x_noisy = target_aug + sigma[:, None, None] * torch.randn_like(target_aug)
+        else:
+            sigma = torch.as_tensor(
+                denoise_sigma, device=target_aug.device, dtype=torch.float32
+            )
+            if sigma.ndim == 0:
+                sigma = sigma.expand(target_aug.shape[0])
+            elif sigma.ndim == 2 and sigma.shape[-1] == 1:
+                sigma = sigma[:, 0]
+            if sigma.shape != (target_aug.shape[0],):
+                raise ValueError(
+                    "denoise_sigma must be scalar or shape [B]/[B, 1]; "
+                    f"got {tuple(sigma.shape)} for batch {target_aug.shape[0]}"
+                )
+
+        if denoise_noise is None:
+            noise = torch.randn_like(target_aug)
+        else:
+            noise = denoise_noise.to(device=target_aug.device, dtype=torch.float32)
+            if noise.shape != target_aug.shape:
+                raise ValueError(
+                    "denoise_noise must match target_atom_coords shape; "
+                    f"got {tuple(noise.shape)} and {tuple(target_aug.shape)}"
+                )
+
+        x_noisy = target_aug + sigma[:, None, None] * noise
         x_noisy = x_noisy * train_mask_f.unsqueeze(-1)
 
         diffusion_output = self.diffusion_module(

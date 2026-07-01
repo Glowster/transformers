@@ -1058,6 +1058,8 @@ class ESMFold2Model(PreTrainedModel):
         msa_subsample_at_inference: bool = True,
         target_atom_coords: Tensor | None = None,
         target_atom_mask: Tensor | None = None,
+        denoise_sigma: Tensor | float | None = None,
+        denoise_noise: Tensor | None = None,
         compute_distogram: bool = True,
         compute_confidence: bool = True,
         train_structure: bool = False,
@@ -1252,6 +1254,8 @@ class ESMFold2Model(PreTrainedModel):
                 target_atom_coords=target_atom_coords,
                 target_atom_mask=target_atom_mask,
                 token_attention_mask=tok_mask,
+                denoise_sigma=denoise_sigma,
+                denoise_noise=denoise_noise,
             )
             output.update(diffusion_output)
             sample_coords = diffusion_output["sample_atom_coords"]
@@ -1421,6 +1425,8 @@ class ESMFold2Model(PreTrainedModel):
         dt: Tensor | None = None,
         target_atom_coords: Tensor | None = None,
         target_atom_mask: Tensor | None = None,
+        denoise_sigma: Tensor | float | None = None,
+        denoise_noise: Tensor | None = None,
         num_loops: int | None = None,
         num_diffusion_samples: int | None = 1,
         num_sampling_steps: int | None = None,
@@ -1466,6 +1472,8 @@ class ESMFold2Model(PreTrainedModel):
             msa_subsample_at_inference=msa_subsample_at_inference,
             target_atom_coords=target_atom_coords,
             target_atom_mask=target_atom_mask,
+            denoise_sigma=denoise_sigma,
+            denoise_noise=denoise_noise,
             compute_distogram=False,
             compute_confidence=False,
             train_structure=True,
