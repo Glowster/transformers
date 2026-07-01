@@ -68,7 +68,7 @@ try:
     )
 
     TRITON_KERNELS_AVAILABLE = True
-except ImportError:
+except (ImportError, RuntimeError):
     _fused_pair_bias = None  # type: ignore[assignment]
     _fused_trimul_with_residual = None  # type: ignore[assignment]
     _FusedLNLinearSwiGLU = None  # type: ignore[assignment]

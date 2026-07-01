@@ -913,6 +913,47 @@ class ESMFold2Model(PreTrainedModel):
                 lm_mask_pct=lm_mask_pct,
             )
 
+    @torch.inference_mode()
+    def compute_lm_z(
+        self,
+        input_ids: Tensor,
+        asym_id: Tensor,
+        residue_index: Tensor,
+        mol_type: Tensor,
+        token_attention_mask: Tensor,
+        lm_mask_pct: float = 0.0,
+    ) -> Tensor:
+        """Compute deterministic ESM-C pair conditioning for cache generation."""
+        if self._esmc is None:
+            raise RuntimeError("compute_lm_z requires ESM-C to be loaded")
+
+        use_amp = input_ids.device.type == "cuda"
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=torch.bfloat16):
+            lm_hidden_states = self._compute_lm_hidden_states(
+                input_ids,
+                asym_id,
+                residue_index,
+                mol_type,
+                token_attention_mask,
+                lm_mask_pct=lm_mask_pct,
+            )
+            lm_z = self.language_model(lm_hidden_states.detach())
+        return lm_z.detach()
+
+    def _validate_lm_z(self, lm_z: Tensor, token_attention_mask: Tensor) -> None:
+        batch_size, num_tokens = token_attention_mask.shape
+        expected = (batch_size, num_tokens, num_tokens, self.config.d_pair)
+        if tuple(lm_z.shape) != expected:
+            raise ValueError(
+                "lm_z must have shape "
+                f"{expected}, got {tuple(lm_z.shape)}"
+            )
+        if lm_z.device != token_attention_mask.device:
+            raise ValueError(
+                "lm_z must be on the same device as token_attention_mask, "
+                f"got {lm_z.device} and {token_attention_mask.device}"
+            )
+
     def _discretized_dynamics(self) -> tuple[Tensor, Tensor]:
         delta = F.softplus(self.parcae_log_delta)
         a = torch.exp(-delta * torch.exp(self.parcae_log_a))
@@ -1047,6 +1088,7 @@ class ESMFold2Model(PreTrainedModel):
         msa_attention_mask: Tensor | None = None,
         input_ids: Tensor | None = None,
         lm_hidden_states: Tensor | None = None,
+        lm_z: Tensor | None = None,
         x_t: Tensor | None = None,
         dt: Tensor | None = None,
         num_loops: int | None = None,
@@ -1143,26 +1185,28 @@ class ESMFold2Model(PreTrainedModel):
             token_bonds_encoding = self.token_bonds(token_bonds.float())
             z_init = z_init + relative_position_encoding + token_bonds_encoding
 
-            if (
-                lm_hidden_states is None
-                and input_ids is not None
-                and self._esmc is not None
-            ):
-                lm_hidden_states = self._compute_lm_hidden_states(
-                    input_ids,
-                    asym_id,
-                    residue_index,
-                    mol_type,
-                    tok_mask,
-                    lm_mask_pct=(
-                        lm_mask_pct
-                        if lm_mask_pct is not None
-                        else self.config.lm_mask_pct
-                    ),
-                )
-            lm_z: Tensor | None = None
-            if lm_hidden_states is not None:
-                lm_z = self.language_model(lm_hidden_states.detach())
+            if lm_z is not None:
+                self._validate_lm_z(lm_z, tok_mask)
+            else:
+                if (
+                    lm_hidden_states is None
+                    and input_ids is not None
+                    and self._esmc is not None
+                ):
+                    lm_hidden_states = self._compute_lm_hidden_states(
+                        input_ids,
+                        asym_id,
+                        residue_index,
+                        mol_type,
+                        tok_mask,
+                        lm_mask_pct=(
+                            lm_mask_pct
+                            if lm_mask_pct is not None
+                            else self.config.lm_mask_pct
+                        ),
+                    )
+                if lm_hidden_states is not None:
+                    lm_z = self.language_model(lm_hidden_states.detach())
             del lm_hidden_states
 
             if (x_t is None) != (dt is None):
@@ -1344,6 +1388,7 @@ class ESMFold2Model(PreTrainedModel):
         msa_attention_mask: Tensor | None = None,
         input_ids: Tensor | None = None,
         lm_hidden_states: Tensor | None = None,
+        lm_z: Tensor | None = None,
         x_t: Tensor | None = None,
         dt: Tensor | None = None,
         num_loops: int | None = None,
@@ -1380,6 +1425,7 @@ class ESMFold2Model(PreTrainedModel):
             msa_attention_mask=msa_attention_mask,
             input_ids=input_ids,
             lm_hidden_states=lm_hidden_states,
+            lm_z=lm_z,
             x_t=x_t,
             dt=dt,
             num_loops=num_loops,
@@ -1421,6 +1467,7 @@ class ESMFold2Model(PreTrainedModel):
         msa_attention_mask: Tensor | None = None,
         input_ids: Tensor | None = None,
         lm_hidden_states: Tensor | None = None,
+        lm_z: Tensor | None = None,
         x_t: Tensor | None = None,
         dt: Tensor | None = None,
         target_atom_coords: Tensor | None = None,
@@ -1461,6 +1508,7 @@ class ESMFold2Model(PreTrainedModel):
             msa_attention_mask=msa_attention_mask,
             input_ids=input_ids,
             lm_hidden_states=lm_hidden_states,
+            lm_z=lm_z,
             x_t=x_t,
             dt=dt,
             num_loops=num_loops,
