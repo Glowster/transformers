@@ -1919,6 +1919,7 @@ class DiffusionStructureHead(nn.Module):
         return_atom_repr: bool = False,
         use_inference_cache: bool = True,
         denoising_early_exit_rmsd: float | None = None,
+        return_sampling_trajectory: bool = False,
     ) -> dict[str, Tensor | None]:
         """Diffusion sampling (Algorithm 18).
 
@@ -1962,6 +1963,16 @@ class DiffusionStructureHead(nn.Module):
         x_denoised_prev: Tensor | None = None
         token_repr: Tensor | None = None
         diff_atom_intermediates: Tensor | None = None
+        sampling_trajectory: list[Tensor] | None = (
+            [] if return_sampling_trajectory else None
+        )
+        sampling_trajectory_sigmas: list[float] | None = (
+            [] if return_sampling_trajectory else None
+        )
+        if sampling_trajectory is not None:
+            sampling_trajectory.append(x.detach().float())
+            assert sampling_trajectory_sigmas is not None
+            sampling_trajectory_sigmas.append(float(schedule[0].item()))
 
         step_pairs = list(zip(schedule[:-1], schedule[1:], gammas[1:]))
         num_steps = len(step_pairs)
@@ -2027,6 +2038,7 @@ class DiffusionStructureHead(nn.Module):
             x = x_noisy + eta * (sigma_t_val - t_hat_val) * denoised_over_sigma
 
             # Denoising early-exit: stop when consecutive predictions converge
+            should_break = False
             if (
                 denoising_early_exit_rmsd is not None
                 and x_denoised_prev is not None
@@ -2046,7 +2058,15 @@ class DiffusionStructureHead(nn.Module):
                 if per_sample_rmsd.max().item() < denoising_early_exit_rmsd:
                     x = x_denoised
                     x_denoised_prev = x_denoised
-                    break
+                    should_break = True
+
+            if sampling_trajectory is not None:
+                sampling_trajectory.append(x.detach().float())
+                assert sampling_trajectory_sigmas is not None
+                sampling_trajectory_sigmas.append(sigma_t_val)
+
+            if should_break:
+                break
 
             x_denoised_prev = x_denoised
 
@@ -2054,6 +2074,16 @@ class DiffusionStructureHead(nn.Module):
             "sample_atom_coords": x,
             "diff_token_repr": token_repr,
         }
+        if sampling_trajectory is not None:
+            result["sampling_trajectory"] = (
+                torch.stack(sampling_trajectory, dim=0)
+                if sampling_trajectory
+                else x.new_empty((0, target_batch, n_atoms, 3), dtype=torch.float32)
+            )
+            assert sampling_trajectory_sigmas is not None
+            result["sampling_trajectory_sigmas"] = torch.tensor(
+                sampling_trajectory_sigmas, device=device, dtype=torch.float32
+            )
         if return_atom_repr:
             result["diff_atom_intermediates"] = diff_atom_intermediates
         return result

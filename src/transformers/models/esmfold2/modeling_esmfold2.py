@@ -675,6 +675,11 @@ class ESMFold2Model(PreTrainedModel):
       sample, so memory scales linearly. Pass ``1`` for cheap inference.
     * ``num_sampling_steps`` (default ``config.structure_head.inference_num_steps``):
       diffusion ODE solver steps. Lower for speed, higher for quality.
+    * ``compute_distogram`` / ``compute_confidence`` (default ``True``):
+      set either to ``False`` to skip those inference heads when only
+      ``sample_atom_coords`` is needed.
+    * ``return_sampling_trajectory`` (default ``False``): return the sampler
+      coordinate state from initial noise through each diffusion update.
 
     Memory / perf knobs:
 
@@ -1105,6 +1110,7 @@ class ESMFold2Model(PreTrainedModel):
         compute_distogram: bool = True,
         compute_confidence: bool = True,
         train_structure: bool = False,
+        return_sampling_trajectory: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         tok_mask = token_attention_mask
@@ -1331,11 +1337,15 @@ class ESMFold2Model(PreTrainedModel):
                 num_sampling_steps=num_sampling_steps,
                 return_atom_repr=False,
                 denoising_early_exit_rmsd=None,
+                return_sampling_trajectory=return_sampling_trajectory,
             )
 
             sample_coords = structure_output["sample_atom_coords"]
             assert sample_coords is not None
             output["sample_atom_coords"] = sample_coords
+            for key in ("sampling_trajectory", "sampling_trajectory_sigmas"):
+                if key in structure_output:
+                    output[key] = structure_output[key]
 
         if compute_confidence:
             assert sample_coords is not None
@@ -1398,6 +1408,9 @@ class ESMFold2Model(PreTrainedModel):
         msa_max_depth: int = 1024,
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
+        compute_distogram: bool = True,
+        compute_confidence: bool = True,
+        return_sampling_trajectory: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         return self._forward_impl(
@@ -1435,8 +1448,9 @@ class ESMFold2Model(PreTrainedModel):
             msa_max_depth=msa_max_depth,
             msa_column_mask_rate=msa_column_mask_rate,
             msa_subsample_at_inference=msa_subsample_at_inference,
-            compute_distogram=True,
-            compute_confidence=True,
+            compute_distogram=compute_distogram,
+            compute_confidence=compute_confidence,
+            return_sampling_trajectory=return_sampling_trajectory,
             train_structure=False,
             **kwargs,
         )
