@@ -982,6 +982,7 @@ class ESMFold2Model(PreTrainedModel):
         b_mat: Tensor,
         tok_mask: Tensor,
         total_steps: int,
+        backprop_last_steps: int | None = None,
     ) -> Tensor:
         # Helper method (not inline) so per-iter locals free on return —
         # otherwise leaks ~2 GB L²×c_z into distogram/sample scope.
@@ -995,75 +996,91 @@ class ESMFold2Model(PreTrainedModel):
         )
         _lm_dropout_p = getattr(lm_cfg, "lm_dropout", 0.0)
 
-        for _ in range(total_steps):
-            if _per_loop_lm_dropout:
-                assert lm_z is not None  # narrowed by _per_loop_lm_dropout
-                lm_z_i: Tensor | None = F.dropout(lm_z, p=_lm_dropout_p, training=True)
-            else:
-                lm_z_i = lm_z
+        grad_steps = total_steps
+        if backprop_last_steps is not None:
+            if backprop_last_steps < 1:
+                raise ValueError("backprop_last_steps must be positive")
+            grad_steps = min(total_steps, int(backprop_last_steps))
+        warmup_steps = total_steps - grad_steps
 
-            refined_lm_z: Tensor | None = None
-            if lm_z_i is not None and self.lm_encoder is not None:
-                refined_lm_z = self.lm_encoder(
-                    lm_z_i.to(z_init.dtype), pair_attention_mask=pair_mask
-                )
+        def run_steps(z: Tensor, n_steps: int) -> Tensor:
+            for _ in range(n_steps):
+                if _per_loop_lm_dropout:
+                    assert lm_z is not None  # narrowed by _per_loop_lm_dropout
+                    lm_z_i: Tensor | None = F.dropout(
+                        lm_z, p=_lm_dropout_p, training=True
+                    )
+                else:
+                    lm_z_i = lm_z
 
-            z_inject_pair = z_init
-            if lm_z_i is not None and self.lm_encoder is None:
-                z_inject_pair = z_inject_pair + lm_z_i.to(z_inject_pair.dtype)
+                refined_lm_z: Tensor | None = None
+                if lm_z_i is not None and self.lm_encoder is not None:
+                    refined_lm_z = self.lm_encoder(
+                        lm_z_i.to(z_init.dtype), pair_attention_mask=pair_mask
+                    )
 
-            if self.msa_encoder is not None and _msa_inputs is not None:
-                # Fresh row subsample each iteration (column mask was applied
-                # once in forward, before this loop).
-                msa_i, mask_i, hd_i, dv_i = maybe_subsample_msa(
-                    _msa_inputs["msa"],
-                    _msa_inputs["msa_attention_mask"],
-                    _msa_inputs["has_deletion"],
-                    _msa_inputs["deletion_value"],
-                    max_depth=_msa_inputs["max_depth"],
-                    enabled=_msa_inputs["subsample_enabled"],
-                )
-                B_msa, M, L_msa = msa_i.shape
-                msa_oh = F.one_hot(
-                    msa_i.permute(0, 2, 1).long(), num_classes=NUM_RES_TYPES
-                ).float()
-                msa_attn = (
-                    mask_i.permute(0, 2, 1).float()
-                    if mask_i is not None
-                    else tok_mask[:, :, None].expand(-1, -1, M).float()
-                )
-                # Bias-free MSAEncoder.embed requires zeroed padding.
-                msa_oh = msa_oh * msa_attn.unsqueeze(-1)
-                hd = (
-                    hd_i.permute(0, 2, 1).float()
-                    if hd_i is not None
-                    else torch.zeros(B_msa, L_msa, M, device=msa_i.device)
-                )
-                dv = (
-                    dv_i.permute(0, 2, 1).float()
-                    if dv_i is not None
-                    else torch.zeros(B_msa, L_msa, M, device=msa_i.device)
-                )
-                msa_pair = self.msa_encoder(
-                    x_pair=z_inject_pair,
-                    x_inputs=_msa_inputs["x_inputs"],
-                    msa_oh=msa_oh,
-                    has_deletion=hd,
-                    deletion_value=dv,
-                    msa_attention_mask=msa_attn,
-                ).to(z_inject_pair.dtype)
-                z_inject_pair = (
-                    msa_pair
-                    if self.config.msa_encoder_overwrite
-                    else (z_inject_pair + msa_pair)
-                )
+                z_inject_pair = z_init
+                if lm_z_i is not None and self.lm_encoder is None:
+                    z_inject_pair = z_inject_pair + lm_z_i.to(z_inject_pair.dtype)
 
-            if refined_lm_z is not None:
-                z_inject_pair = z_inject_pair + refined_lm_z.to(z_inject_pair.dtype)
+                if self.msa_encoder is not None and _msa_inputs is not None:
+                    # Fresh row subsample each iteration (column mask was applied
+                    # once in forward, before this loop).
+                    msa_i, mask_i, hd_i, dv_i = maybe_subsample_msa(
+                        _msa_inputs["msa"],
+                        _msa_inputs["msa_attention_mask"],
+                        _msa_inputs["has_deletion"],
+                        _msa_inputs["deletion_value"],
+                        max_depth=_msa_inputs["max_depth"],
+                        enabled=_msa_inputs["subsample_enabled"],
+                    )
+                    B_msa, M, L_msa = msa_i.shape
+                    msa_oh = F.one_hot(
+                        msa_i.permute(0, 2, 1).long(), num_classes=NUM_RES_TYPES
+                    ).float()
+                    msa_attn = (
+                        mask_i.permute(0, 2, 1).float()
+                        if mask_i is not None
+                        else tok_mask[:, :, None].expand(-1, -1, M).float()
+                    )
+                    # Bias-free MSAEncoder.embed requires zeroed padding.
+                    msa_oh = msa_oh * msa_attn.unsqueeze(-1)
+                    hd = (
+                        hd_i.permute(0, 2, 1).float()
+                        if hd_i is not None
+                        else torch.zeros(B_msa, L_msa, M, device=msa_i.device)
+                    )
+                    dv = (
+                        dv_i.permute(0, 2, 1).float()
+                        if dv_i is not None
+                        else torch.zeros(B_msa, L_msa, M, device=msa_i.device)
+                    )
+                    msa_pair = self.msa_encoder(
+                        x_pair=z_inject_pair,
+                        x_inputs=_msa_inputs["x_inputs"],
+                        msa_oh=msa_oh,
+                        has_deletion=hd,
+                        deletion_value=dv,
+                        msa_attention_mask=msa_attn,
+                    ).to(z_inject_pair.dtype)
+                    z_inject_pair = (
+                        msa_pair
+                        if self.config.msa_encoder_overwrite
+                        else (z_inject_pair + msa_pair)
+                    )
 
-            injected_pair = self.parcae_input_norm(z_inject_pair)
-            z = a * z + F.linear(injected_pair.to(z.dtype), b_mat)
-            z = self.folding_trunk(z, pair_attention_mask=pair_mask)
+                if refined_lm_z is not None:
+                    z_inject_pair = z_inject_pair + refined_lm_z.to(z_inject_pair.dtype)
+
+                injected_pair = self.parcae_input_norm(z_inject_pair)
+                z = a * z + F.linear(injected_pair.to(z.dtype), b_mat)
+                z = self.folding_trunk(z, pair_attention_mask=pair_mask)
+            return z
+
+        if warmup_steps > 0:
+            for _ in range(warmup_steps):
+                z = run_steps(z, 1).detach()
+        z = run_steps(z, grad_steps)
 
         return z
 
@@ -1110,6 +1127,7 @@ class ESMFold2Model(PreTrainedModel):
         compute_distogram: bool = True,
         compute_confidence: bool = True,
         train_structure: bool = False,
+        backprop_last_steps: int | None = None,
         return_sampling_trajectory: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
@@ -1265,6 +1283,7 @@ class ESMFold2Model(PreTrainedModel):
                 b_mat=b_mat,
                 tok_mask=tok_mask,
                 total_steps=total_steps,
+                backprop_last_steps=backprop_last_steps,
             )
             del z_init, lm_z, _msa_inputs, a, b_mat
 
@@ -1491,6 +1510,7 @@ class ESMFold2Model(PreTrainedModel):
         num_loops: int | None = None,
         num_diffusion_samples: int | None = 1,
         num_sampling_steps: int | None = None,
+        backprop_last_steps: int | None = None,
         lm_mask_pct: float | None = None,
         msa_max_depth: int = 1024,
         msa_column_mask_rate: float = 0.1,
@@ -1528,6 +1548,7 @@ class ESMFold2Model(PreTrainedModel):
             num_loops=num_loops,
             num_diffusion_samples=num_diffusion_samples,
             num_sampling_steps=num_sampling_steps,
+            backprop_last_steps=backprop_last_steps,
             lm_mask_pct=lm_mask_pct,
             msa_max_depth=msa_max_depth,
             msa_column_mask_rate=msa_column_mask_rate,

@@ -2854,6 +2854,10 @@ class FoldingTrunk(nn.Module):
                 for _ in range(n_layers)
             ]
         )
+        self._activation_checkpointing = True
+
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        self._activation_checkpointing = bool(enabled)
 
     def set_kernel_backend(self, backend: str | None) -> None:
         for block in self.blocks:
@@ -2877,7 +2881,7 @@ class FoldingTrunk(nn.Module):
             pair = pair.to(torch.bfloat16)
         for block in self.blocks:
             fn = partial(block, pair_attention_mask=pair_attention_mask)
-            if torch.is_grad_enabled():
+            if torch.is_grad_enabled() and self._activation_checkpointing:
                 pair = checkpoint(fn, pair, use_reentrant=False)  # pyright: ignore
             else:
                 pair = fn(pair)
