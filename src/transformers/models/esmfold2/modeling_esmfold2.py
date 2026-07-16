@@ -1124,6 +1124,10 @@ class ESMFold2Model(PreTrainedModel):
         target_atom_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        transition_scaled_diffusion: bool = False,
+        transition_scale: Tensor | float | None = None,
+        x_t_atom_mask: Tensor | None = None,
+        center_inference: bool = True,
         compute_distogram: bool = True,
         compute_confidence: bool = True,
         train_structure: bool = False,
@@ -1325,10 +1329,18 @@ class ESMFold2Model(PreTrainedModel):
                 token_attention_mask=tok_mask,
                 denoise_sigma=denoise_sigma,
                 denoise_noise=denoise_noise,
+                transition_scaled_diffusion=transition_scaled_diffusion,
+                transition_scale=transition_scale,
             )
             output.update(diffusion_output)
             sample_coords = diffusion_output["sample_atom_coords"]
         else:
+            if transition_scaled_diffusion and (
+                x_t is None or x_t_atom_mask is None
+            ):
+                raise ValueError(
+                    "transition-scaled inference requires x_t and x_t_atom_mask"
+                )
             sample_fn = (
                 self.structure_head.sample_train
                 if train_structure
@@ -1357,6 +1369,13 @@ class ESMFold2Model(PreTrainedModel):
                 return_atom_repr=False,
                 denoising_early_exit_rmsd=None,
                 return_sampling_trajectory=return_sampling_trajectory,
+                transition_scaled_diffusion=transition_scaled_diffusion,
+                transition_scale=transition_scale,
+                initial_center=x_t if transition_scaled_diffusion else None,
+                initial_center_mask=(
+                    x_t_atom_mask if transition_scaled_diffusion else None
+                ),
+                center_inference=center_inference,
             )
 
             sample_coords = structure_output["sample_atom_coords"]
@@ -1430,6 +1449,10 @@ class ESMFold2Model(PreTrainedModel):
         compute_distogram: bool = True,
         compute_confidence: bool = True,
         return_sampling_trajectory: bool = False,
+        transition_scaled_diffusion: bool = False,
+        transition_scale: Tensor | float | None = None,
+        x_t_atom_mask: Tensor | None = None,
+        center_inference: bool = True,
         **kwargs,
     ) -> dict[str, Tensor]:
         return self._forward_impl(
@@ -1470,6 +1493,10 @@ class ESMFold2Model(PreTrainedModel):
             compute_distogram=compute_distogram,
             compute_confidence=compute_confidence,
             return_sampling_trajectory=return_sampling_trajectory,
+            transition_scaled_diffusion=transition_scaled_diffusion,
+            transition_scale=transition_scale,
+            x_t_atom_mask=x_t_atom_mask,
+            center_inference=center_inference,
             train_structure=False,
             **kwargs,
         )
@@ -1507,6 +1534,8 @@ class ESMFold2Model(PreTrainedModel):
         target_atom_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        transition_scaled_diffusion: bool = False,
+        transition_scale: Tensor | float | None = None,
         num_loops: int | None = None,
         num_diffusion_samples: int | None = 1,
         num_sampling_steps: int | None = None,
@@ -1557,6 +1586,8 @@ class ESMFold2Model(PreTrainedModel):
             target_atom_mask=target_atom_mask,
             denoise_sigma=denoise_sigma,
             denoise_noise=denoise_noise,
+            transition_scaled_diffusion=transition_scaled_diffusion,
+            transition_scale=transition_scale,
             compute_distogram=False,
             compute_confidence=False,
             train_structure=True,

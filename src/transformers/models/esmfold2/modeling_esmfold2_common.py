@@ -1697,6 +1697,8 @@ class DiffusionStructureHead(nn.Module):
         token_attention_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        transition_scaled_diffusion: bool = False,
+        transition_scale: Tensor | float | None = None,
     ) -> dict[str, Tensor]:
         """Single-noise-level denoising objective for diffusion training."""
         if target_atom_coords.shape != ref_pos.shape:
@@ -1719,7 +1721,7 @@ class DiffusionStructureHead(nn.Module):
         target_aug = target_aug * train_mask_f.unsqueeze(-1)
 
         if denoise_sigma is None:
-            sigma = self.sigma_data * torch.exp(
+            sigma_legacy = self.sigma_data * torch.exp(
                 float(self.train_noise_log_mean)
                 + float(self.train_noise_log_std)
                 * torch.randn(
@@ -1727,18 +1729,49 @@ class DiffusionStructureHead(nn.Module):
                 )
             )
         else:
-            sigma = torch.as_tensor(
+            sigma_legacy = torch.as_tensor(
                 denoise_sigma, device=target_aug.device, dtype=torch.float32
             )
-            if sigma.ndim == 0:
-                sigma = sigma.expand(target_aug.shape[0])
-            elif sigma.ndim == 2 and sigma.shape[-1] == 1:
-                sigma = sigma[:, 0]
-            if sigma.shape != (target_aug.shape[0],):
+            if sigma_legacy.ndim == 0:
+                sigma_legacy = sigma_legacy.expand(target_aug.shape[0])
+            elif sigma_legacy.ndim == 2 and sigma_legacy.shape[-1] == 1:
+                sigma_legacy = sigma_legacy[:, 0]
+            if sigma_legacy.shape != (target_aug.shape[0],):
                 raise ValueError(
                     "denoise_sigma must be scalar or shape [B]/[B, 1]; "
-                    f"got {tuple(sigma.shape)} for batch {target_aug.shape[0]}"
+                    f"got {tuple(sigma_legacy.shape)} for batch {target_aug.shape[0]}"
                 )
+
+        scale: Tensor | None = None
+        if transition_scaled_diffusion:
+            if abs(float(self.sigma_data) - 16.0) > 1e-8:
+                raise ValueError(
+                    "transition-scaled diffusion requires sigma_data=16; "
+                    f"got {self.sigma_data:g}"
+                )
+            if transition_scale is None:
+                raise ValueError(
+                    "transition_scale is required for transition-scaled training"
+                )
+            scale = torch.as_tensor(
+                transition_scale, device=target_aug.device, dtype=torch.float32
+            )
+            if scale.ndim == 0:
+                scale = scale.expand(target_aug.shape[0])
+            elif scale.ndim == 2 and scale.shape[-1] == 1:
+                scale = scale[:, 0]
+            if scale.shape != (target_aug.shape[0],):
+                raise ValueError(
+                    "transition_scale must be scalar or shape [B]/[B, 1]; "
+                    f"got {tuple(scale.shape)} for batch {target_aug.shape[0]}"
+                )
+            if not torch.isfinite(scale).all() or (scale <= 0).any():
+                raise ValueError(
+                    "transition_scale must contain only finite positive values"
+                )
+            sigma_effective = scale * sigma_legacy / float(self.sigma_data)
+        else:
+            sigma_effective = sigma_legacy
 
         if denoise_noise is None:
             noise = torch.randn_like(target_aug)
@@ -1750,12 +1783,12 @@ class DiffusionStructureHead(nn.Module):
                     f"got {tuple(noise.shape)} and {tuple(target_aug.shape)}"
                 )
 
-        x_noisy = target_aug + sigma[:, None, None] * noise
+        x_noisy = target_aug + sigma_effective[:, None, None] * noise
         x_noisy = x_noisy * train_mask_f.unsqueeze(-1)
 
         diffusion_output = self.diffusion_module(
             x_noisy=x_noisy,
-            t_hat=sigma,
+            t_hat=sigma_effective,
             ref_pos=ref_pos,
             ref_charge=ref_charge,
             ref_mask=train_atom_mask,
@@ -1783,23 +1816,46 @@ class DiffusionStructureHead(nn.Module):
         sq = (x_denoised.float() - target_aug.float()).square().sum(dim=-1)
         noisy_sq = (x_noisy.float() - target_aug.float()).square().sum(dim=-1)
         denom = train_mask_f.sum().clamp_min(1.0)
-        loss = (sq * train_mask_f).sum() / denom
+        raw_loss = (sq * train_mask_f).sum() / denom
+        if transition_scaled_diffusion:
+            assert scale is not None
+            loss = (
+                sq * train_mask_f / scale.square()[:, None]
+            ).sum() / denom
+        else:
+            loss = raw_loss
         noisy_mse = (noisy_sq * train_mask_f).sum() / denom
 
-        return {
+        result = {
             "loss": loss,
             "x_pred": x_denoised,
             "sample_atom_coords": x_denoised,
             "x_noisy": x_noisy,
             "target_atom_coords_augmented": target_aug,
             "target_atom_mask": train_atom_mask,
-            "noise_sigma": sigma,
-            "denoise_mse": loss.detach(),
-            "denoise_rmsd": loss.detach().sqrt(),
+            "noise_sigma": sigma_effective,
+            "denoise_mse": raw_loss.detach(),
+            "denoise_rmsd": raw_loss.detach().sqrt(),
             "noisy_mse": noisy_mse.detach(),
             "noisy_rmsd": noisy_mse.detach().sqrt(),
-            "noise_sigma_mean": sigma.detach().mean(),
+            "noise_sigma_mean": sigma_effective.detach().mean(),
         }
+        if transition_scaled_diffusion:
+            assert scale is not None
+            result.update(
+                {
+                    "transition_normalized_mse": loss.detach(),
+                    "raw_endpoint_mse": raw_loss.detach(),
+                    "noise_sigma_legacy": sigma_legacy.detach(),
+                    "noise_sigma_legacy_mean": sigma_legacy.detach().mean(),
+                    "transition_scale": scale.detach(),
+                    "transition_scale_mean": scale.detach().mean(),
+                    "transition_noise_c": target_aug.new_tensor(
+                        1.0 / float(self.sigma_data)
+                    ),
+                }
+            )
+        return result
 
     def inference_noise_schedule(
         self, num_steps: int | None = None, device: torch.device | None = None
@@ -1892,6 +1948,289 @@ class DiffusionStructureHead(nn.Module):
     # Sampling
     # ------------------------------------------------------------------
 
+    def _sample_transition_scaled_impl(
+        self,
+        *,
+        legacy_schedule: Tensor,
+        z_trunk: Tensor,
+        s_inputs: Tensor,
+        s_trunk: Tensor | None,
+        relative_position_encoding: Tensor,
+        ref_pos: Tensor,
+        ref_charge: Tensor,
+        ref_mask: Tensor,
+        ref_element: Tensor,
+        ref_atom_name_chars: Tensor,
+        ref_space_uid: Tensor,
+        tok_idx: Tensor,
+        asym_id: Tensor,
+        residue_index: Tensor,
+        entity_id: Tensor,
+        token_index: Tensor,
+        sym_id: Tensor,
+        transition_scale: Tensor | float | None,
+        initial_center: Tensor | None,
+        initial_center_mask: Tensor | None,
+        center_inference: bool,
+        token_attention_mask: Tensor | None,
+        num_diffusion_samples: int,
+        noise_scale: float | None,
+        step_scale: float | None,
+        return_atom_repr: bool,
+        inference_cache: dict[str, Tensor] | None,
+        denoising_early_exit_rmsd: float | None,
+        return_sampling_trajectory: bool,
+    ) -> dict[str, Tensor | None]:
+        """Sample with a per-example schedule scaled by the MD transition RMS."""
+        if abs(float(self.sigma_data) - 16.0) > 1e-8:
+            raise ValueError(
+                "transition-scaled diffusion requires sigma_data=16; "
+                f"got {self.sigma_data:g}"
+            )
+        if transition_scale is None:
+            raise ValueError(
+                "transition_scale is required for transition-scaled inference"
+            )
+
+        base_batch = s_inputs.shape[0]
+        n_atoms = tok_idx.shape[1]
+        device = s_inputs.device
+        target_batch = base_batch * num_diffusion_samples
+
+        scale = torch.as_tensor(
+            transition_scale, device=device, dtype=torch.float32
+        )
+        if scale.ndim == 0:
+            scale = scale.expand(base_batch)
+        elif scale.ndim == 2 and scale.shape[-1] == 1:
+            scale = scale[:, 0]
+        if scale.shape != (base_batch,):
+            raise ValueError(
+                "transition_scale must be scalar or shape [B]/[B, 1]; "
+                f"got {tuple(scale.shape)} for batch {base_batch}"
+            )
+        if not torch.isfinite(scale).all() or (scale < 0).any():
+            raise ValueError(
+                "transition_scale must contain only finite non-negative values"
+            )
+        zero_scale = scale == 0
+        if zero_scale.any() and not zero_scale.all():
+            raise ValueError(
+                "mixed zero/nonzero transition-scale batches must be partitioned "
+                "by the caller"
+            )
+
+        atom_mask = ref_mask.repeat_interleave(num_diffusion_samples, 0).float()
+
+        centered_samples: Tensor | None = None
+        if initial_center is not None:
+            if initial_center.shape != (base_batch, n_atoms, 3):
+                raise ValueError(
+                    "initial_center must have shape [B, A, 3]; "
+                    f"got {tuple(initial_center.shape)}, expected "
+                    f"{(base_batch, n_atoms, 3)}"
+                )
+            if initial_center_mask is None:
+                raise ValueError(
+                    "initial_center_mask is required with initial_center"
+                )
+            if initial_center_mask.shape != (base_batch, n_atoms):
+                raise ValueError(
+                    "initial_center_mask must have shape [B, A]; "
+                    f"got {tuple(initial_center_mask.shape)}, expected "
+                    f"{(base_batch, n_atoms)}"
+                )
+            center_mask = initial_center_mask.to(device=device).bool() & ref_mask.bool()
+            if (center_mask.sum(dim=1) == 0).any():
+                raise ValueError("each initial_center sample needs at least one valid atom")
+            center = initial_center.to(device=device, dtype=torch.float32)
+            center_mask_f = center_mask.float().unsqueeze(-1)
+            center_mean = (center * center_mask_f).sum(dim=1, keepdim=True)
+            center_mean = center_mean / center_mask_f.sum(
+                dim=1, keepdim=True
+            ).clamp_min(1.0)
+            centered = (center - center_mean) * center_mask_f
+            centered_samples = centered.repeat_interleave(
+                num_diffusion_samples, dim=0
+            )
+
+        scale_samples = scale.repeat_interleave(num_diffusion_samples, dim=0)
+
+        # s(0)=0 is a deterministic identity transition. Do not draw noise or
+        # enter the diffusion loop.
+        if zero_scale.all():
+            if centered_samples is None:
+                raise ValueError(
+                    "zero-lag transition inference requires an initial_center"
+                )
+            x = centered_samples * atom_mask.unsqueeze(-1)
+            result: dict[str, Tensor | None] = {
+                "sample_atom_coords": x,
+                "diff_token_repr": None,
+            }
+            if return_sampling_trajectory:
+                result["sampling_trajectory"] = x.detach().float().unsqueeze(0)
+                result["sampling_trajectory_sigmas"] = torch.zeros(
+                    (1, target_batch), device=device, dtype=torch.float32
+                )
+            if return_atom_repr:
+                result["diff_atom_intermediates"] = None
+            return result
+
+        effective_schedule = (
+            scale_samples[:, None]
+            * legacy_schedule[None, :]
+            / float(self.sigma_data)
+        )
+        lam = self.noise_scale if noise_scale is None else float(noise_scale)
+        eta = self.step_scale if step_scale is None else float(step_scale)
+
+        noise = torch.randn(
+            target_batch, n_atoms, 3, device=device, dtype=torch.float32
+        )
+        x = effective_schedule[:, 0, None, None] * noise
+        if center_inference:
+            if centered_samples is None:
+                raise ValueError(
+                    "centered transition inference requires an initial_center"
+                )
+            x = x + centered_samples
+        x = x * atom_mask.unsqueeze(-1)
+
+        gammas = torch.where(
+            effective_schedule > self.gamma_min,
+            torch.full_like(effective_schedule, self.gamma_0),
+            torch.zeros_like(effective_schedule),
+        )
+
+        x_denoised_prev: Tensor | None = None
+        token_repr: Tensor | None = None
+        diff_atom_intermediates: Tensor | None = None
+        sampling_trajectory: list[Tensor] | None = (
+            [] if return_sampling_trajectory else None
+        )
+        sampling_trajectory_sigmas: list[Tensor] | None = (
+            [] if return_sampling_trajectory else None
+        )
+        if sampling_trajectory is not None:
+            sampling_trajectory.append(x.detach().float())
+            assert sampling_trajectory_sigmas is not None
+            sampling_trajectory_sigmas.append(effective_schedule[:, 0].detach())
+
+        num_steps = effective_schedule.shape[1] - 1
+        for step_idx in range(num_steps):
+            x, x_denoised_prev = self._center_random_augmentation(
+                x, atom_mask, second_coords=x_denoised_prev
+            )
+
+            sigma_tm = effective_schedule[:, step_idx]
+            sigma_t = effective_schedule[:, step_idx + 1]
+            # Preserve the legacy gammas[1:] convention.
+            gamma = gammas[:, step_idx + 1]
+            t_hat = sigma_tm * (1.0 + gamma)
+            eps_std = lam * (
+                t_hat.square() - sigma_tm.square()
+            ).clamp_min(0.0).sqrt()
+            x_noisy = x + eps_std[:, None, None] * torch.randn_like(x)
+
+            is_last_step = step_idx == num_steps - 1
+            request_atom_repr = return_atom_repr and (
+                is_last_step or denoising_early_exit_rmsd is not None
+            )
+
+            dm_out = self.diffusion_module(
+                x_noisy=x_noisy,
+                t_hat=t_hat,
+                ref_pos=ref_pos,
+                ref_charge=ref_charge,
+                ref_mask=ref_mask,
+                ref_element=ref_element,
+                ref_atom_name_chars=ref_atom_name_chars,
+                ref_space_uid=ref_space_uid,
+                tok_idx=tok_idx,
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                z_trunk=z_trunk,
+                relative_position_encoding=relative_position_encoding,
+                asym_id=asym_id,
+                residue_index=residue_index,
+                entity_id=entity_id,
+                token_index=token_index,
+                sym_id=sym_id,
+                token_attention_mask=token_attention_mask,
+                num_diffusion_samples=num_diffusion_samples,
+                return_token_repr=True,
+                return_atom_repr=request_atom_repr,
+                inference_cache=inference_cache,
+            )
+
+            x_denoised = dm_out["x_denoised"]
+            token_repr = dm_out["token_repr"]
+            assert x_denoised is not None
+            if request_atom_repr:
+                diff_atom_intermediates = dm_out.get("atom_intermediates")
+
+            with torch.autocast(device_type="cuda", enabled=False):
+                x_noisy = self._weighted_rigid_align(
+                    x_noisy.float(), x_denoised.float(), atom_mask, atom_mask
+                )
+            x_noisy = x_noisy.to(dtype=x_denoised.dtype)
+
+            denoised_over_sigma = (
+                x_noisy - x_denoised
+            ) / t_hat[:, None, None]
+            x = x_noisy + eta * (
+                sigma_t - t_hat
+            )[:, None, None] * denoised_over_sigma
+
+            should_break = False
+            if (
+                denoising_early_exit_rmsd is not None
+                and x_denoised_prev is not None
+                and step_idx >= 1
+            ):
+                with torch.autocast(device_type="cuda", enabled=False):
+                    aligned = self._weighted_rigid_align(
+                        x_denoised_prev.float(),
+                        x_denoised.float(),
+                        atom_mask,
+                        atom_mask,
+                    )
+                diff = (x_denoised.float() - aligned) * atom_mask.unsqueeze(-1)
+                per_sample_rmsd = (
+                    diff.pow(2).sum(dim=(-1, -2))
+                    / atom_mask.sum(dim=-1).clamp(min=1)
+                ).sqrt()
+                if per_sample_rmsd.max().item() < denoising_early_exit_rmsd:
+                    x = x_denoised
+                    x_denoised_prev = x_denoised
+                    should_break = True
+
+            if sampling_trajectory is not None:
+                sampling_trajectory.append(x.detach().float())
+                assert sampling_trajectory_sigmas is not None
+                sampling_trajectory_sigmas.append(sigma_t.detach())
+
+            if should_break:
+                break
+            x_denoised_prev = x_denoised
+
+        result = {
+            "sample_atom_coords": x,
+            "diff_token_repr": token_repr,
+        }
+        if sampling_trajectory is not None:
+            result["sampling_trajectory"] = torch.stack(
+                sampling_trajectory, dim=0
+            )
+            assert sampling_trajectory_sigmas is not None
+            result["sampling_trajectory_sigmas"] = torch.stack(
+                sampling_trajectory_sigmas, dim=0
+            )
+        if return_atom_repr:
+            result["diff_atom_intermediates"] = diff_atom_intermediates
+        return result
+
     def _sample_impl(
         self,
         z_trunk: Tensor,
@@ -1920,6 +2259,11 @@ class DiffusionStructureHead(nn.Module):
         use_inference_cache: bool = True,
         denoising_early_exit_rmsd: float | None = None,
         return_sampling_trajectory: bool = False,
+        transition_scaled_diffusion: bool = False,
+        transition_scale: Tensor | float | None = None,
+        initial_center: Tensor | None = None,
+        initial_center_mask: Tensor | None = None,
+        center_inference: bool = True,
     ) -> dict[str, Tensor | None]:
         """Diffusion sampling (Algorithm 18).
 
@@ -1945,6 +2289,39 @@ class DiffusionStructureHead(nn.Module):
         if max_inference_sigma is not None:
             schedule = schedule[schedule <= float(max_inference_sigma)]
             schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
+
+        if transition_scaled_diffusion:
+            return self._sample_transition_scaled_impl(
+                legacy_schedule=schedule,
+                z_trunk=z_trunk,
+                s_inputs=s_inputs,
+                s_trunk=s_trunk,
+                relative_position_encoding=relative_position_encoding,
+                ref_pos=ref_pos,
+                ref_charge=ref_charge,
+                ref_mask=ref_mask,
+                ref_element=ref_element,
+                ref_atom_name_chars=ref_atom_name_chars,
+                ref_space_uid=ref_space_uid,
+                tok_idx=tok_idx,
+                asym_id=asym_id,
+                residue_index=residue_index,
+                entity_id=entity_id,
+                token_index=token_index,
+                sym_id=sym_id,
+                transition_scale=transition_scale,
+                initial_center=initial_center,
+                initial_center_mask=initial_center_mask,
+                center_inference=center_inference,
+                token_attention_mask=token_attention_mask,
+                num_diffusion_samples=num_diffusion_samples,
+                noise_scale=noise_scale,
+                step_scale=step_scale,
+                return_atom_repr=return_atom_repr,
+                inference_cache=inference_cache,
+                denoising_early_exit_rmsd=denoising_early_exit_rmsd,
+                return_sampling_trajectory=return_sampling_trajectory,
+            )
 
         lam = self.noise_scale if noise_scale is None else float(noise_scale)
         eta = self.step_scale if step_scale is None else float(step_scale)
