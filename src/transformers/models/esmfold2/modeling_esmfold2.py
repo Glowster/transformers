@@ -1124,6 +1124,7 @@ class ESMFold2Model(PreTrainedModel):
         target_atom_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
         x_t_atom_mask: Tensor | None = None,
@@ -1329,6 +1330,7 @@ class ESMFold2Model(PreTrainedModel):
                 token_attention_mask=tok_mask,
                 denoise_sigma=denoise_sigma,
                 denoise_noise=denoise_noise,
+                sigma_weighted_denoising_loss=sigma_weighted_denoising_loss,
                 transition_scaled_diffusion=transition_scaled_diffusion,
                 transition_scale=transition_scale,
             )
@@ -1534,6 +1536,7 @@ class ESMFold2Model(PreTrainedModel):
         target_atom_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
         num_loops: int | None = None,
@@ -1544,6 +1547,7 @@ class ESMFold2Model(PreTrainedModel):
         msa_max_depth: int = 1024,
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
+        compute_distogram: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         return self._forward_impl(
@@ -1586,9 +1590,10 @@ class ESMFold2Model(PreTrainedModel):
             target_atom_mask=target_atom_mask,
             denoise_sigma=denoise_sigma,
             denoise_noise=denoise_noise,
+            sigma_weighted_denoising_loss=sigma_weighted_denoising_loss,
             transition_scaled_diffusion=transition_scaled_diffusion,
             transition_scale=transition_scale,
-            compute_distogram=False,
+            compute_distogram=compute_distogram,
             compute_confidence=False,
             train_structure=True,
             **kwargs,

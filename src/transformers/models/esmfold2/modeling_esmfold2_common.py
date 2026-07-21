@@ -1697,6 +1697,7 @@ class DiffusionStructureHead(nn.Module):
         token_attention_mask: Tensor | None = None,
         denoise_sigma: Tensor | float | None = None,
         denoise_noise: Tensor | None = None,
+        sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
     ) -> dict[str, Tensor]:
@@ -1817,7 +1818,32 @@ class DiffusionStructureHead(nn.Module):
         noisy_sq = (x_noisy.float() - target_aug.float()).square().sum(dim=-1)
         denom = train_mask_f.sum().clamp_min(1.0)
         raw_loss = (sq * train_mask_f).sum() / denom
-        if transition_scaled_diffusion:
+        sigma_loss_weight: Tensor | None = None
+        if sigma_weighted_denoising_loss:
+            if (
+                not torch.isfinite(sigma_effective).all()
+                or (sigma_effective <= 0).any()
+            ):
+                raise ValueError(
+                    "sigma-weighted denoising loss requires finite positive noise levels"
+                )
+            per_sample_atom_count = train_mask_f.sum(dim=-1)
+            valid_sample = per_sample_atom_count > 0
+            per_sample_mse = (sq * train_mask_f).sum(dim=-1)
+            per_sample_mse = per_sample_mse / per_sample_atom_count.clamp_min(1.0)
+            if transition_scaled_diffusion:
+                assert scale is not None
+                per_sample_mse = per_sample_mse / scale.square()
+
+            sigma2 = sigma_effective.float().square()
+            sigma_data2 = float(self.sigma_data) ** 2
+            sigma_loss_weight = (sigma2 + sigma_data2) / (
+                sigma2 * sigma_data2
+            )
+            valid_sample_f = valid_sample.float()
+            loss = (per_sample_mse * sigma_loss_weight * valid_sample_f).sum()
+            loss = loss / valid_sample_f.sum().clamp_min(1.0)
+        elif transition_scaled_diffusion:
             assert scale is not None
             loss = (
                 sq * train_mask_f / scale.square()[:, None]
@@ -1840,6 +1866,13 @@ class DiffusionStructureHead(nn.Module):
             "noisy_rmsd": noisy_mse.detach().sqrt(),
             "noise_sigma_mean": sigma_effective.detach().mean(),
         }
+        if sigma_loss_weight is not None:
+            result.update(
+                {
+                    "sigma_weighted_denoising_loss": loss.detach(),
+                    "sigma_loss_weight_mean": sigma_loss_weight.detach().mean(),
+                }
+            )
         if transition_scaled_diffusion:
             assert scale is not None
             result.update(
