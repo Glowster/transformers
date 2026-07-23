@@ -1329,6 +1329,8 @@ class DiffusionTransformer(nn.Module):
 class DiffusionConditioning(nn.Module):
     """Conditions pair and single representations on noise timestep."""
 
+    MD_PAIR_GATE_INIT = 0.01
+
     def __init__(
         self,
         c_z: int = 256,
@@ -1347,6 +1349,9 @@ class DiffusionConditioning(nn.Module):
 
         self.z_input_norm = nn.LayerNorm(2 * c_z, eps=layer_norm_eps)
         self.z_proj = nn.Linear(2 * c_z, c_z, bias=False)
+        self.md_pair_norm = nn.LayerNorm(c_z, eps=layer_norm_eps)
+        self.md_pair_proj = nn.Linear(c_z, c_z, bias=False)
+        self.md_pair_gate = nn.Parameter(torch.tensor(self.MD_PAIR_GATE_INIT))
         self.z_transitions = nn.ModuleList(
             [
                 TransitionLayer(c_z, n=transition_multiplier, eps=layer_norm_eps)
@@ -1365,6 +1370,84 @@ class DiffusionConditioning(nn.Module):
                 for _ in range(2)
             ]
         )
+        self.reset_md_pair_adapter()
+
+    def reset_md_pair_adapter(self) -> None:
+        """Initialize late MD conditioning as a small, gradient-carrying branch."""
+        nn.init.ones_(self.md_pair_norm.weight)
+        nn.init.zeros_(self.md_pair_norm.bias)
+        nn.init.eye_(self.md_pair_proj.weight)
+        with torch.no_grad():
+            self.md_pair_gate.fill_(self.MD_PAIR_GATE_INIT)
+
+    def md_pair_update(
+        self,
+        md_pair_conditioning: Tensor,
+        token_attention_mask: Tensor | None,
+    ) -> Tensor:
+        if md_pair_conditioning.shape[-1] != self.c_z:
+            raise ValueError(
+                "md_pair_conditioning must have final dimension "
+                f"{self.c_z}, got {tuple(md_pair_conditioning.shape)}"
+            )
+        update = self.md_pair_proj(
+            self.md_pair_norm(md_pair_conditioning.to(dtype=torch.float32))
+        )
+        if token_attention_mask is not None:
+            expected = (
+                token_attention_mask.shape[0],
+                token_attention_mask.shape[1],
+                token_attention_mask.shape[1],
+            )
+            if tuple(update.shape[:3]) != expected:
+                raise ValueError(
+                    "md_pair_conditioning must match token_attention_mask pair "
+                    f"shape {expected}, got {tuple(update.shape[:3])}"
+                )
+            pair_mask = (
+                token_attention_mask[:, :, None].bool()
+                & token_attention_mask[:, None, :].bool()
+            )
+            update = update * pair_mask[..., None].to(dtype=update.dtype)
+        return self.md_pair_gate.to(dtype=update.dtype) * update
+
+    def md_single_update(
+        self,
+        md_single_conditioning: Tensor,
+        *,
+        base_batch: int,
+        num_diffusion_samples: int,
+        num_tokens: int,
+        token_attention_mask: Tensor | None,
+    ) -> Tensor:
+        """Broadcast a physical-dt embedding over tokens and diffusion samples."""
+        if md_single_conditioning.ndim != 2 or md_single_conditioning.shape[-1] != self.c_s:
+            raise ValueError(
+                "md_single_conditioning must have shape [B, c_s] with c_s="
+                f"{self.c_s}; got {tuple(md_single_conditioning.shape)}"
+            )
+        target_batch = base_batch * num_diffusion_samples
+        update = md_single_conditioning.to(dtype=torch.float32)
+        if update.shape[0] == base_batch:
+            update = update.repeat_interleave(num_diffusion_samples, dim=0)
+        elif update.shape[0] != target_batch:
+            raise ValueError(
+                "md_single_conditioning batch must match the base or sampled batch; "
+                f"got {update.shape[0]}, expected {base_batch} or {target_batch}"
+            )
+        update = update[:, None, :].expand(-1, num_tokens, -1)
+        if token_attention_mask is not None:
+            expected = (base_batch, num_tokens)
+            if tuple(token_attention_mask.shape) != expected:
+                raise ValueError(
+                    "token_attention_mask must match the base token shape "
+                    f"{expected}, got {tuple(token_attention_mask.shape)}"
+                )
+            single_mask = token_attention_mask.repeat_interleave(
+                num_diffusion_samples, dim=0
+            )
+            update = update * single_mask[..., None].to(dtype=update.dtype)
+        return update
 
     def forward(
         self,
@@ -1376,6 +1459,9 @@ class DiffusionConditioning(nn.Module):
         sigma_data: float | None = None,
         num_diffusion_samples: int = 1,
         inference_cache: dict[str, Tensor] | None = None,
+        md_pair_conditioning: Tensor | None = None,
+        md_single_conditioning: Tensor | None = None,
+        token_attention_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         sigma = self.sigma_data if sigma_data is None else float(sigma_data)
         base_batch = z_trunk.shape[0]
@@ -1388,6 +1474,16 @@ class DiffusionConditioning(nn.Module):
             z_rel = relative_position_encoding.to(dtype=torch.float32)
             z = torch.cat([z_trunk.to(dtype=torch.float32), z_rel], dim=-1)
             z = self.z_proj(self.z_input_norm(z))
+            if md_pair_conditioning is not None:
+                if md_pair_conditioning.shape != z_trunk.shape:
+                    raise ValueError(
+                        "md_pair_conditioning must match z_trunk shape; "
+                        f"got {tuple(md_pair_conditioning.shape)} and "
+                        f"{tuple(z_trunk.shape)}"
+                    )
+                z = z + self.md_pair_update(
+                    md_pair_conditioning, token_attention_mask
+                )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 for block in self.z_transitions:
                     z = z + block(z)
@@ -1411,6 +1507,14 @@ class DiffusionConditioning(nn.Module):
         n = self.fourier(t_noise)
         n = self.noise_proj(self.noise_norm(n))
         s = s + n.unsqueeze(1)
+        if md_single_conditioning is not None:
+            s = s + self.md_single_update(
+                md_single_conditioning,
+                base_batch=base_batch,
+                num_diffusion_samples=num_diffusion_samples,
+                num_tokens=s.shape[1],
+                token_attention_mask=token_attention_mask,
+            )
 
         for block in self.s_transitions:
             s = s + block(s)
@@ -1532,6 +1636,8 @@ class DiffusionModule(nn.Module):
         return_token_repr: bool = False,
         return_atom_repr: bool = False,
         inference_cache: dict[str, Tensor] | None = None,
+        md_pair_conditioning: Tensor | None = None,
+        md_single_conditioning: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
         bsz = x_noisy.shape[0]
         sigma = self.sigma_data if sigma_data is None else float(sigma_data)
@@ -1551,6 +1657,9 @@ class DiffusionModule(nn.Module):
             sigma_data=sigma,
             num_diffusion_samples=num_diffusion_samples,
             inference_cache=inference_cache,
+            md_pair_conditioning=md_pair_conditioning,
+            md_single_conditioning=md_single_conditioning,
+            token_attention_mask=token_attention_mask,
         )
 
         # Step 2: normalize noisy coords
@@ -1674,6 +1783,61 @@ class DiffusionStructureHead(nn.Module):
     # Helpers
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _batch_transition_scale(
+        value: Tensor | float | None,
+        *,
+        batch_size: int,
+        device: torch.device,
+        name: str,
+        allow_zero: bool = False,
+    ) -> Tensor:
+        if value is None:
+            raise ValueError(f"{name} is required")
+        scale = torch.as_tensor(value, device=device, dtype=torch.float32)
+        if scale.ndim == 0:
+            scale = scale.expand(batch_size)
+        elif scale.ndim == 2 and scale.shape[-1] == 1:
+            scale = scale[:, 0]
+        if scale.shape != (batch_size,):
+            raise ValueError(
+                f"{name} must be scalar or shape [B]/[B, 1]; "
+                f"got {tuple(scale.shape)} for batch {batch_size}"
+            )
+        invalid = scale < 0 if allow_zero else scale <= 0
+        qualifier = "non-negative" if allow_zero else "positive"
+        if not torch.isfinite(scale).all() or invalid.any():
+            raise ValueError(
+                f"{name} must contain only finite {qualifier} values"
+            )
+        return scale
+
+    @staticmethod
+    def _normalized_transition_endpoint(
+        endpoint: Tensor,
+        center: Tensor,
+        transition_scale: Tensor,
+        reference_scale: Tensor,
+        atom_mask: Tensor,
+    ) -> Tensor:
+        ratio = reference_scale / transition_scale
+        normalized = center + ratio[:, None, None] * (endpoint - center)
+        return normalized * atom_mask.float().unsqueeze(-1)
+
+    @staticmethod
+    def _physical_transition_endpoint(
+        normalized_endpoint: Tensor,
+        center: Tensor,
+        transition_scale: Tensor,
+        reference_scale: Tensor,
+        atom_mask: Tensor,
+    ) -> Tensor:
+        ratio = transition_scale / reference_scale
+        endpoint = center + ratio[:, None, None] * (
+            normalized_endpoint - center
+        )
+        return endpoint * atom_mask.float().unsqueeze(-1)
+
     def train_denoising(
         self,
         z_trunk: Tensor,
@@ -1700,6 +1864,12 @@ class DiffusionStructureHead(nn.Module):
         sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
+        transition_normalized_residual: bool = False,
+        transition_reference_scale: Tensor | float | None = None,
+        transition_center: Tensor | None = None,
+        transition_center_mask: Tensor | None = None,
+        md_pair_conditioning: Tensor | None = None,
+        md_single_conditioning: Tensor | None = None,
     ) -> dict[str, Tensor]:
         """Single-noise-level denoising objective for diffusion training."""
         if target_atom_coords.shape != ref_pos.shape:
@@ -1717,9 +1887,88 @@ class DiffusionStructureHead(nn.Module):
         train_atom_mask = train_atom_mask & ref_mask.bool()
         train_mask_f = train_atom_mask.float()
         target_coords = target_atom_coords.to(device=ref_pos.device, dtype=torch.float32)
+        batch_size = target_coords.shape[0]
 
-        target_aug, _ = self._center_random_augmentation(target_coords, train_mask_f)
+        if transition_normalized_residual and not transition_scaled_diffusion:
+            raise ValueError(
+                "transition-normalized residual training requires "
+                "transition_scaled_diffusion"
+            )
+
+        scale: Tensor | None = None
+        reference_scale: Tensor | None = None
+        diffusion_scale: Tensor | None = None
+        center_aug: Tensor | None = None
+        if transition_scaled_diffusion:
+            if abs(float(self.sigma_data) - 16.0) > 1e-8:
+                raise ValueError(
+                    "transition-scaled diffusion requires sigma_data=16; "
+                    f"got {self.sigma_data:g}"
+                )
+            scale = self._batch_transition_scale(
+                transition_scale,
+                batch_size=batch_size,
+                device=target_coords.device,
+                name="transition_scale",
+            )
+            diffusion_scale = scale
+
+        denoising_target = target_coords
+        if transition_normalized_residual:
+            if transition_center is None or transition_center_mask is None:
+                raise ValueError(
+                    "transition-normalized residual training requires "
+                    "transition_center and transition_center_mask"
+                )
+            if transition_center.shape != target_coords.shape:
+                raise ValueError(
+                    "transition_center must match target_atom_coords; "
+                    f"got {tuple(transition_center.shape)} and "
+                    f"{tuple(target_coords.shape)}"
+                )
+            if transition_center_mask.shape != target_atom_mask.shape:
+                raise ValueError(
+                    "transition_center_mask must match target_atom_mask; "
+                    f"got {tuple(transition_center_mask.shape)} and "
+                    f"{tuple(target_atom_mask.shape)}"
+                )
+            center_mask = transition_center_mask.to(device=ref_pos.device).bool()
+            if not torch.equal(center_mask & ref_mask.bool(), train_atom_mask):
+                raise ValueError(
+                    "transition_center_mask must select the same atoms as the "
+                    "training target mask"
+                )
+            center = transition_center.to(
+                device=ref_pos.device, dtype=torch.float32
+            )
+            reference_scale = self._batch_transition_scale(
+                transition_reference_scale,
+                batch_size=batch_size,
+                device=target_coords.device,
+                name="transition_reference_scale",
+            )
+            assert scale is not None
+            denoising_target = self._normalized_transition_endpoint(
+                target_coords,
+                center,
+                scale,
+                reference_scale,
+                train_atom_mask,
+            )
+            target_aug, center_aug = self._center_random_augmentation(
+                denoising_target,
+                train_mask_f,
+                second_coords=center,
+            )
+            assert center_aug is not None
+            diffusion_scale = reference_scale
+        else:
+            target_aug, _ = self._center_random_augmentation(
+                denoising_target, train_mask_f
+            )
         target_aug = target_aug * train_mask_f.unsqueeze(-1)
+        if center_aug is not None:
+            center_aug = center_aug * train_mask_f.unsqueeze(-1)
 
         if denoise_sigma is None:
             sigma_legacy = self.sigma_data * torch.exp(
@@ -1743,34 +1992,11 @@ class DiffusionStructureHead(nn.Module):
                     f"got {tuple(sigma_legacy.shape)} for batch {target_aug.shape[0]}"
                 )
 
-        scale: Tensor | None = None
         if transition_scaled_diffusion:
-            if abs(float(self.sigma_data) - 16.0) > 1e-8:
-                raise ValueError(
-                    "transition-scaled diffusion requires sigma_data=16; "
-                    f"got {self.sigma_data:g}"
-                )
-            if transition_scale is None:
-                raise ValueError(
-                    "transition_scale is required for transition-scaled training"
-                )
-            scale = torch.as_tensor(
-                transition_scale, device=target_aug.device, dtype=torch.float32
+            assert diffusion_scale is not None
+            sigma_effective = (
+                diffusion_scale * sigma_legacy / float(self.sigma_data)
             )
-            if scale.ndim == 0:
-                scale = scale.expand(target_aug.shape[0])
-            elif scale.ndim == 2 and scale.shape[-1] == 1:
-                scale = scale[:, 0]
-            if scale.shape != (target_aug.shape[0],):
-                raise ValueError(
-                    "transition_scale must be scalar or shape [B]/[B, 1]; "
-                    f"got {tuple(scale.shape)} for batch {target_aug.shape[0]}"
-                )
-            if not torch.isfinite(scale).all() or (scale <= 0).any():
-                raise ValueError(
-                    "transition_scale must contain only finite positive values"
-                )
-            sigma_effective = scale * sigma_legacy / float(self.sigma_data)
         else:
             sigma_effective = sigma_legacy
 
@@ -1810,14 +2036,51 @@ class DiffusionStructureHead(nn.Module):
             num_diffusion_samples=1,
             return_token_repr=False,
             return_atom_repr=False,
+            md_pair_conditioning=md_pair_conditioning,
+            md_single_conditioning=md_single_conditioning,
         )
 
         x_denoised = diffusion_output["x_denoised"]
         assert x_denoised is not None
         sq = (x_denoised.float() - target_aug.float()).square().sum(dim=-1)
         noisy_sq = (x_noisy.float() - target_aug.float()).square().sum(dim=-1)
+        x_denoised_physical = x_denoised
+        x_noisy_physical = x_noisy
+        target_physical_aug = target_aug
+        if transition_normalized_residual:
+            assert scale is not None
+            assert reference_scale is not None
+            assert center_aug is not None
+            x_denoised_physical = self._physical_transition_endpoint(
+                x_denoised.float(),
+                center_aug,
+                scale,
+                reference_scale,
+                train_atom_mask,
+            )
+            x_noisy_physical = self._physical_transition_endpoint(
+                x_noisy.float(),
+                center_aug,
+                scale,
+                reference_scale,
+                train_atom_mask,
+            )
+            target_physical_aug = self._physical_transition_endpoint(
+                target_aug.float(),
+                center_aug,
+                scale,
+                reference_scale,
+                train_atom_mask,
+            )
+        endpoint_sq = (
+            x_denoised_physical.float() - target_physical_aug.float()
+        ).square().sum(dim=-1)
+        endpoint_noisy_sq = (
+            x_noisy_physical.float() - target_physical_aug.float()
+        ).square().sum(dim=-1)
         denom = train_mask_f.sum().clamp_min(1.0)
-        raw_loss = (sq * train_mask_f).sum() / denom
+        objective_raw_loss = (sq * train_mask_f).sum() / denom
+        raw_loss = (endpoint_sq * train_mask_f).sum() / denom
         sigma_loss_weight: Tensor | None = None
         if sigma_weighted_denoising_loss:
             if (
@@ -1832,8 +2095,8 @@ class DiffusionStructureHead(nn.Module):
             per_sample_mse = (sq * train_mask_f).sum(dim=-1)
             per_sample_mse = per_sample_mse / per_sample_atom_count.clamp_min(1.0)
             if transition_scaled_diffusion:
-                assert scale is not None
-                per_sample_mse = per_sample_mse / scale.square()
+                assert diffusion_scale is not None
+                per_sample_mse = per_sample_mse / diffusion_scale.square()
 
             sigma2 = sigma_effective.float().square()
             sigma_data2 = float(self.sigma_data) ** 2
@@ -1844,28 +2107,129 @@ class DiffusionStructureHead(nn.Module):
             loss = (per_sample_mse * sigma_loss_weight * valid_sample_f).sum()
             loss = loss / valid_sample_f.sum().clamp_min(1.0)
         elif transition_scaled_diffusion:
-            assert scale is not None
+            assert diffusion_scale is not None
             loss = (
-                sq * train_mask_f / scale.square()[:, None]
+                sq * train_mask_f / diffusion_scale.square()[:, None]
             ).sum() / denom
         else:
-            loss = raw_loss
-        noisy_mse = (noisy_sq * train_mask_f).sum() / denom
+            loss = objective_raw_loss
+        noisy_mse = (endpoint_noisy_sq * train_mask_f).sum() / denom
+        physical_noise_sigma = sigma_effective
+        if transition_normalized_residual:
+            assert scale is not None
+            assert reference_scale is not None
+            physical_noise_sigma = sigma_effective * scale / reference_scale
 
         result = {
             "loss": loss,
-            "x_pred": x_denoised,
-            "sample_atom_coords": x_denoised,
-            "x_noisy": x_noisy,
-            "target_atom_coords_augmented": target_aug,
+            "x_pred": x_denoised_physical,
+            "sample_atom_coords": x_denoised_physical,
+            "x_noisy": x_noisy_physical,
+            "target_atom_coords_augmented": target_physical_aug,
             "target_atom_mask": train_atom_mask,
-            "noise_sigma": sigma_effective,
+            "noise_sigma": physical_noise_sigma,
             "denoise_mse": raw_loss.detach(),
             "denoise_rmsd": raw_loss.detach().sqrt(),
             "noisy_mse": noisy_mse.detach(),
             "noisy_rmsd": noisy_mse.detach().sqrt(),
-            "noise_sigma_mean": sigma_effective.detach().mean(),
+            "noise_sigma_mean": physical_noise_sigma.detach().mean(),
         }
+        if md_pair_conditioning is not None:
+            with torch.no_grad():
+                if token_attention_mask is None:
+                    pair_mask_f = torch.ones(
+                        md_pair_conditioning.shape[:3],
+                        device=md_pair_conditioning.device,
+                        dtype=torch.float32,
+                    )
+                else:
+                    pair_mask_f = (
+                        token_attention_mask[:, :, None].bool()
+                        & token_attention_mask[:, None, :].bool()
+                    ).float()
+                pair_denom = (
+                    pair_mask_f.sum() * md_pair_conditioning.shape[-1]
+                ).clamp_min(1.0)
+
+                md_pair_f = md_pair_conditioning.detach().float()
+                md_pair_rms = (
+                    (md_pair_f.square() * pair_mask_f[..., None]).sum()
+                    / pair_denom
+                ).sqrt()
+                md_update = self.diffusion_module.conditioning.md_pair_update(
+                    md_pair_f, token_attention_mask
+                )
+                md_update_rms = (
+                    (md_update.square() * pair_mask_f[..., None]).sum()
+                    / pair_denom
+                ).sqrt()
+                z_trunk_f = z_trunk.detach().float()
+                z_trunk_rms = (
+                    (z_trunk_f.square() * pair_mask_f[..., None]).sum()
+                    / pair_denom
+                ).sqrt()
+                result.update(
+                    {
+                        "md_conditioning_rms": md_pair_rms,
+                        "md_diffusion_update_rms": md_update_rms,
+                        "diffusion_z_trunk_rms": z_trunk_rms,
+                        "md_diffusion_update_ratio": (
+                            md_update_rms / z_trunk_rms.clamp_min(1e-12)
+                        ),
+                        "md_diffusion_gate": (
+                            self.diffusion_module.conditioning.md_pair_gate
+                            .detach()
+                            .float()
+                        ),
+                    }
+                )
+        if md_single_conditioning is not None:
+            with torch.no_grad():
+                conditioning = self.diffusion_module.conditioning
+                md_single_f = md_single_conditioning.detach().float()
+                md_single_rms = md_single_f.square().mean().sqrt()
+                md_single_update = conditioning.md_single_update(
+                    md_single_f,
+                    base_batch=s_inputs.shape[0],
+                    num_diffusion_samples=1,
+                    num_tokens=s_inputs.shape[1],
+                    token_attention_mask=token_attention_mask,
+                )
+                if token_attention_mask is None:
+                    single_mask_f = torch.ones(
+                        s_inputs.shape[:2],
+                        device=s_inputs.device,
+                        dtype=torch.float32,
+                    )
+                else:
+                    single_mask_f = token_attention_mask.float()
+                single_denom = (
+                    single_mask_f.sum() * md_single_update.shape[-1]
+                ).clamp_min(1.0)
+                md_single_update_rms = (
+                    (
+                        md_single_update.square()
+                        * single_mask_f[..., None]
+                    ).sum()
+                    / single_denom
+                ).sqrt()
+                s_input = conditioning.s_proj(
+                    conditioning.s_input_norm(s_inputs.detach().float())
+                )
+                s_input_rms = (
+                    (s_input.square() * single_mask_f[..., None]).sum()
+                    / single_denom
+                ).sqrt()
+                result.update(
+                    {
+                        "md_dt_single_rms": md_single_rms,
+                        "md_dt_single_update_rms": md_single_update_rms,
+                        "diffusion_s_input_rms": s_input_rms,
+                        "md_dt_single_update_ratio": (
+                            md_single_update_rms / s_input_rms.clamp_min(1e-12)
+                        ),
+                    }
+                )
         if sigma_loss_weight is not None:
             result.update(
                 {
@@ -1886,6 +2250,21 @@ class DiffusionStructureHead(nn.Module):
                     "transition_noise_c": target_aug.new_tensor(
                         1.0 / float(self.sigma_data)
                     ),
+                }
+            )
+        if transition_normalized_residual:
+            assert reference_scale is not None
+            result.update(
+                {
+                    "transition_normalized_residual": target_aug.new_tensor(True),
+                    "transition_reference_scale": reference_scale.detach(),
+                    "transition_reference_scale_mean": (
+                        reference_scale.detach().mean()
+                    ),
+                    "normalized_x_pred": x_denoised,
+                    "normalized_x_noisy": x_noisy,
+                    "normalized_target_atom_coords_augmented": target_aug,
+                    "normalized_endpoint_mse": objective_raw_loss.detach(),
                 }
             )
         return result
@@ -2013,6 +2392,8 @@ class DiffusionStructureHead(nn.Module):
         inference_cache: dict[str, Tensor] | None,
         denoising_early_exit_rmsd: float | None,
         return_sampling_trajectory: bool,
+        md_pair_conditioning: Tensor | None,
+        md_single_conditioning: Tensor | None,
     ) -> dict[str, Tensor | None]:
         """Sample with a per-example schedule scaled by the MD transition RMS."""
         if abs(float(self.sigma_data) - 16.0) > 1e-8:
@@ -2195,6 +2576,8 @@ class DiffusionStructureHead(nn.Module):
                 return_token_repr=True,
                 return_atom_repr=request_atom_repr,
                 inference_cache=inference_cache,
+                md_pair_conditioning=md_pair_conditioning,
+                md_single_conditioning=md_single_conditioning,
             )
 
             x_denoised = dm_out["x_denoised"]
@@ -2294,9 +2677,13 @@ class DiffusionStructureHead(nn.Module):
         return_sampling_trajectory: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
+        transition_normalized_residual: bool = False,
+        transition_reference_scale: Tensor | float | None = None,
         initial_center: Tensor | None = None,
         initial_center_mask: Tensor | None = None,
         center_inference: bool = True,
+        md_pair_conditioning: Tensor | None = None,
+        md_single_conditioning: Tensor | None = None,
     ) -> dict[str, Tensor | None]:
         """Diffusion sampling (Algorithm 18).
 
@@ -2324,7 +2711,104 @@ class DiffusionStructureHead(nn.Module):
             schedule = F.pad(schedule, (1, 0), value=float(max_inference_sigma))
 
         if transition_scaled_diffusion:
-            return self._sample_transition_scaled_impl(
+            if not transition_normalized_residual:
+                return self._sample_transition_scaled_impl(
+                    legacy_schedule=schedule,
+                    z_trunk=z_trunk,
+                    s_inputs=s_inputs,
+                    s_trunk=s_trunk,
+                    relative_position_encoding=relative_position_encoding,
+                    ref_pos=ref_pos,
+                    ref_charge=ref_charge,
+                    ref_mask=ref_mask,
+                    ref_element=ref_element,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                    ref_space_uid=ref_space_uid,
+                    tok_idx=tok_idx,
+                    asym_id=asym_id,
+                    residue_index=residue_index,
+                    entity_id=entity_id,
+                    token_index=token_index,
+                    sym_id=sym_id,
+                    transition_scale=transition_scale,
+                    initial_center=initial_center,
+                    initial_center_mask=initial_center_mask,
+                    center_inference=center_inference,
+                    token_attention_mask=token_attention_mask,
+                    num_diffusion_samples=num_diffusion_samples,
+                    noise_scale=noise_scale,
+                    step_scale=step_scale,
+                    return_atom_repr=return_atom_repr,
+                    inference_cache=inference_cache,
+                    denoising_early_exit_rmsd=denoising_early_exit_rmsd,
+                    return_sampling_trajectory=return_sampling_trajectory,
+                    md_pair_conditioning=md_pair_conditioning,
+                    md_single_conditioning=md_single_conditioning,
+                )
+            if not center_inference:
+                raise ValueError(
+                    "transition-normalized residual inference requires "
+                    "center_inference=True"
+                )
+            if initial_center is None or initial_center_mask is None:
+                raise ValueError(
+                    "transition-normalized residual inference requires an "
+                    "initial center and mask"
+                )
+            actual_scale = self._batch_transition_scale(
+                transition_scale,
+                batch_size=s_inputs.shape[0],
+                device=device,
+                name="transition_scale",
+                allow_zero=True,
+            )
+            zero_scale = actual_scale == 0
+            if zero_scale.any():
+                if not zero_scale.all():
+                    raise ValueError(
+                        "mixed zero/nonzero transition-scale batches must be "
+                        "partitioned by the caller"
+                    )
+                return self._sample_transition_scaled_impl(
+                    legacy_schedule=schedule,
+                    z_trunk=z_trunk,
+                    s_inputs=s_inputs,
+                    s_trunk=s_trunk,
+                    relative_position_encoding=relative_position_encoding,
+                    ref_pos=ref_pos,
+                    ref_charge=ref_charge,
+                    ref_mask=ref_mask,
+                    ref_element=ref_element,
+                    ref_atom_name_chars=ref_atom_name_chars,
+                    ref_space_uid=ref_space_uid,
+                    tok_idx=tok_idx,
+                    asym_id=asym_id,
+                    residue_index=residue_index,
+                    entity_id=entity_id,
+                    token_index=token_index,
+                    sym_id=sym_id,
+                    transition_scale=actual_scale,
+                    initial_center=initial_center,
+                    initial_center_mask=initial_center_mask,
+                    center_inference=True,
+                    token_attention_mask=token_attention_mask,
+                    num_diffusion_samples=num_diffusion_samples,
+                    noise_scale=noise_scale,
+                    step_scale=step_scale,
+                    return_atom_repr=return_atom_repr,
+                    inference_cache=inference_cache,
+                    denoising_early_exit_rmsd=denoising_early_exit_rmsd,
+                    return_sampling_trajectory=return_sampling_trajectory,
+                    md_pair_conditioning=md_pair_conditioning,
+                    md_single_conditioning=md_single_conditioning,
+                )
+            reference_scale = self._batch_transition_scale(
+                transition_reference_scale,
+                batch_size=s_inputs.shape[0],
+                device=device,
+                name="transition_reference_scale",
+            )
+            result = self._sample_transition_scaled_impl(
                 legacy_schedule=schedule,
                 z_trunk=z_trunk,
                 s_inputs=s_inputs,
@@ -2342,7 +2826,7 @@ class DiffusionStructureHead(nn.Module):
                 entity_id=entity_id,
                 token_index=token_index,
                 sym_id=sym_id,
-                transition_scale=transition_scale,
+                transition_scale=reference_scale,
                 initial_center=initial_center,
                 initial_center_mask=initial_center_mask,
                 center_inference=center_inference,
@@ -2354,7 +2838,49 @@ class DiffusionStructureHead(nn.Module):
                 inference_cache=inference_cache,
                 denoising_early_exit_rmsd=denoising_early_exit_rmsd,
                 return_sampling_trajectory=return_sampling_trajectory,
+                md_pair_conditioning=md_pair_conditioning,
+                md_single_conditioning=md_single_conditioning,
             )
+            normalized = result["sample_atom_coords"]
+            assert normalized is not None
+            result["normalized_sample_atom_coords"] = normalized
+            result["sample_atom_coords"] = self._reconstruct_transition_samples(
+                normalized,
+                initial_center=initial_center,
+                initial_center_mask=initial_center_mask,
+                transition_scale=actual_scale,
+                reference_scale=reference_scale,
+                num_diffusion_samples=num_diffusion_samples,
+                ref_mask=ref_mask,
+            )
+            trajectory = result.get("sampling_trajectory")
+            if trajectory is not None:
+                result["normalized_sampling_trajectory"] = trajectory
+                result["sampling_trajectory"] = torch.stack(
+                    [
+                        self._reconstruct_transition_samples(
+                            frame,
+                            initial_center=initial_center,
+                            initial_center_mask=initial_center_mask,
+                            transition_scale=actual_scale,
+                            reference_scale=reference_scale,
+                            num_diffusion_samples=num_diffusion_samples,
+                            ref_mask=ref_mask,
+                        )
+                        for frame in trajectory
+                    ],
+                    dim=0,
+                )
+            trajectory_sigmas = result.get("sampling_trajectory_sigmas")
+            if trajectory_sigmas is not None:
+                scale_ratio = (actual_scale / reference_scale).repeat_interleave(
+                    num_diffusion_samples
+                )
+                result["normalized_sampling_trajectory_sigmas"] = trajectory_sigmas
+                result["sampling_trajectory_sigmas"] = (
+                    trajectory_sigmas * scale_ratio[None, :]
+                )
+            return result
 
         lam = self.noise_scale if noise_scale is None else float(noise_scale)
         eta = self.step_scale if step_scale is None else float(step_scale)
@@ -2428,6 +2954,8 @@ class DiffusionStructureHead(nn.Module):
                 return_token_repr=True,
                 return_atom_repr=request_atom_repr,
                 inference_cache=inference_cache,
+                md_pair_conditioning=md_pair_conditioning,
+                md_single_conditioning=md_single_conditioning,
             )
 
             x_denoised = dm_out["x_denoised"]
@@ -2497,6 +3025,55 @@ class DiffusionStructureHead(nn.Module):
         if return_atom_repr:
             result["diff_atom_intermediates"] = diff_atom_intermediates
         return result
+
+    def _reconstruct_transition_samples(
+        self,
+        normalized_endpoint: Tensor,
+        *,
+        initial_center: Tensor,
+        initial_center_mask: Tensor,
+        transition_scale: Tensor,
+        reference_scale: Tensor,
+        num_diffusion_samples: int,
+        ref_mask: Tensor,
+    ) -> Tensor:
+        """Align a normalized endpoint to x_t and apply the exact inverse scale."""
+
+        base_batch, n_atoms = initial_center.shape[:2]
+        expected_batch = base_batch * num_diffusion_samples
+        if normalized_endpoint.shape != (expected_batch, n_atoms, 3):
+            raise ValueError(
+                "normalized endpoint has unexpected shape; got "
+                f"{tuple(normalized_endpoint.shape)}, expected "
+                f"{(expected_batch, n_atoms, 3)}"
+            )
+        center_mask = initial_center_mask.to(device=normalized_endpoint.device).bool()
+        center_mask = center_mask & ref_mask.bool()
+        center_mask_f = center_mask.float().unsqueeze(-1)
+        center = initial_center.to(
+            device=normalized_endpoint.device, dtype=torch.float32
+        )
+        center_mean = (center * center_mask_f).sum(dim=1, keepdim=True)
+        center_mean = center_mean / center_mask_f.sum(
+            dim=1, keepdim=True
+        ).clamp_min(1.0)
+        center = (center - center_mean) * center_mask_f
+        center = center.repeat_interleave(num_diffusion_samples, dim=0)
+        sample_mask = center_mask.repeat_interleave(num_diffusion_samples, dim=0)
+        with torch.autocast(device_type="cuda", enabled=False):
+            aligned = self._weighted_rigid_align(
+                normalized_endpoint.float(),
+                center.float(),
+                sample_mask.float(),
+                sample_mask,
+            )
+        return self._physical_transition_endpoint(
+            aligned,
+            center,
+            transition_scale.repeat_interleave(num_diffusion_samples),
+            reference_scale.repeat_interleave(num_diffusion_samples),
+            sample_mask,
+        )
 
     @torch.inference_mode()
     @wraps(_sample_impl)

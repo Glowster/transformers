@@ -40,6 +40,7 @@ from .modeling_esmfold2_common import (
     CHAR_VOCAB_SIZE,
     MAX_ATOMIC_NUMBER,
     NUM_RES_TYPES,
+    DiffusionConditioning,
     DiffusionStructureHead,
     FoldingTrunk,
     InputsEmbedder,
@@ -490,7 +491,7 @@ def _lm_precision_context(fp8: bool):
 
 
 class FourierDTEncoder(nn.Module):
-    """Fourier features for MD timestep conditioning.
+    """Log-time Fourier features for MD timestep conditioning.
 
     Expects dt in seconds and uses log(dt in ns), which keeps the 1-500 ns
     training range numerically well-scaled.
@@ -577,20 +578,43 @@ class CAFramePairEncoder(nn.Module):
 
 
 class MDConditioning(nn.Module):
-    """Build an lm_z-shaped pair bias from current MD frame and timestep."""
+    """Encode the current MD frame for pair paths and physical time for z/s paths."""
 
-    def __init__(self, d_pair: int) -> None:
+    def __init__(self, d_pair: int, d_single: int = 768) -> None:
         super().__init__()
         self.ca_pair_encoder = CAFramePairEncoder(d_pair=d_pair)
+        # Retained for the legacy pre-recurrent route and checkpoint compatibility.
         self.dt_encoder = FourierDTEncoder(d_pair=d_pair)
+        # Late routes inject physical time into the diffusion single representation.
+        self.dt_single_encoder = FourierDTEncoder(d_pair=d_single)
+        self.dt_single_gain_raw = nn.Parameter(
+            torch.tensor(self._inverse_softplus(1.0), dtype=torch.float32)
+        )
         self.register_buffer(
             "ca_atom_name",
             torch.tensor([ord("C") - 32, ord("A") - 32, 0, 0], dtype=torch.long),
         )
 
+    @staticmethod
+    def _inverse_softplus(value: float) -> float:
+        value = float(value)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("dt single gain must be finite and positive")
+        return value + math.log(-math.expm1(-value))
+
+    def dt_single_gain(self) -> Tensor:
+        """Return the strictly positive physical-dt gain."""
+        return F.softplus(self.dt_single_gain_raw)
+
+    def set_dt_single_gain(self, value: float) -> None:
+        raw_value = self._inverse_softplus(value)
+        with torch.no_grad():
+            self.dt_single_gain_raw.fill_(raw_value)
+
     def zero_init_output(self) -> None:
         self.ca_pair_encoder.zero_init_output()
         self.dt_encoder.zero_init_output()
+        self.dt_single_encoder.zero_init_output()
 
     def _gather_ca_coords(
         self,
@@ -637,7 +661,7 @@ class MDConditioning(nn.Module):
 
         return coords / counts.clamp_min(1.0).unsqueeze(-1)
 
-    def forward(
+    def forward_components(
         self,
         x_t: Tensor,
         dt: Tensor,
@@ -645,7 +669,7 @@ class MDConditioning(nn.Module):
         ref_atom_name_chars: Tensor,
         atom_attention_mask: Tensor,
         token_attention_mask: Tensor,
-    ) -> Tensor:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         ca_xyz = self._gather_ca_coords(
             x_t=x_t,
             atom_to_token=atom_to_token,
@@ -655,9 +679,37 @@ class MDConditioning(nn.Module):
         )
         z_xt = self.ca_pair_encoder(ca_xyz, token_attention_mask)
         z_dt = self.dt_encoder(dt)[:, None, None, :]
-        z = z_xt + z_dt.to(dtype=z_xt.dtype)
         pair_mask = token_attention_mask[:, :, None] & token_attention_mask[:, None, :]
-        return z * pair_mask[..., None].to(dtype=z.dtype)
+        pair_mask_f = pair_mask[..., None].to(dtype=z_xt.dtype)
+        z_xt = z_xt * pair_mask_f
+        z_dt = z_dt.to(dtype=z_xt.dtype) * pair_mask_f
+        z = z_xt + z_dt
+        s_dt = self.dt_single_encoder(dt)
+        gain = self.dt_single_gain().to(device=s_dt.device, dtype=s_dt.dtype)
+        s_dt = gain * s_dt
+        return z, z_xt, z_dt, s_dt
+
+    def forward(
+        self,
+        x_t: Tensor,
+        dt: Tensor,
+        atom_to_token: Tensor,
+        ref_atom_name_chars: Tensor,
+        atom_attention_mask: Tensor,
+        token_attention_mask: Tensor,
+        return_components: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor]:
+        z, z_xt, z_dt, _ = self.forward_components(
+            x_t=x_t,
+            dt=dt,
+            atom_to_token=atom_to_token,
+            ref_atom_name_chars=ref_atom_name_chars,
+            atom_attention_mask=atom_attention_mask,
+            token_attention_mask=token_attention_mask,
+        )
+        if return_components:
+            return z, z_xt, z_dt
+        return z
 
 
 class ESMFold2Model(PreTrainedModel):
@@ -680,6 +732,12 @@ class ESMFold2Model(PreTrainedModel):
       ``sample_atom_coords`` is needed.
     * ``return_sampling_trajectory`` (default ``False``): return the sampler
       coordinate state from initial noise through each diffusion update.
+    * ``md_conditioning_trunk`` / ``md_conditioning_diffusion`` /
+      ``md_conditioning_post_trunk_add`` (defaults ``True`` / ``False`` /
+      ``False``): route optional ``x_t``/``dt`` conditioning through the
+      recurrent trunk, or route ``x_t`` through a late pair path and ``dt``
+      through the diffusion single representation. The post-trunk route adds
+      ``x_t`` directly to the completed trunk pair state.
 
     Memory / perf knobs:
 
@@ -691,7 +749,17 @@ class ESMFold2Model(PreTrainedModel):
     """
 
     config_class = ESMFold2Config
+    _keys_to_ignore_on_load_missing = [
+        r"structure_head\.diffusion_module\.conditioning\.md_pair_gate",
+        r"structure_head\.diffusion_module\.conditioning\.md_pair_norm\..*",
+        r"structure_head\.diffusion_module\.conditioning\.md_pair_proj\..*",
+    ]
     _keys_to_ignore_on_load_unexpected = [r"\._extra_state$"]
+
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        if isinstance(module, DiffusionConditioning):
+            module.reset_md_pair_adapter()
 
     def __init__(self, config: ESMFold2Config) -> None:
         super().__init__(config)
@@ -710,7 +778,10 @@ class ESMFold2Model(PreTrainedModel):
         self.language_model = LanguageModelShim(
             d_z=d_pair, d_model=config.lm_d_model, num_layers=config.lm_num_layers
         )
-        self.md_conditioning = MDConditioning(d_pair=d_pair)
+        self.md_conditioning = MDConditioning(
+            d_pair=d_pair,
+            d_single=config.structure_head.diffusion_module.c_token,
+        )
         self._esmc: nn.Module | None = None
         self._esmc_fp8: bool = False  # set by load_esmc(fp8=True)
 
@@ -1127,6 +1198,11 @@ class ESMFold2Model(PreTrainedModel):
         sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
+        transition_normalized_residual: bool = False,
+        transition_reference_scale: Tensor | float | None = None,
+        md_conditioning_trunk: bool = True,
+        md_conditioning_diffusion: bool = False,
+        md_conditioning_post_trunk_add: bool = False,
         x_t_atom_mask: Tensor | None = None,
         center_inference: bool = True,
         compute_distogram: bool = True,
@@ -1240,16 +1316,35 @@ class ESMFold2Model(PreTrainedModel):
 
             if (x_t is None) != (dt is None):
                 raise ValueError("x_t and dt must be provided together")
-            if x_t is not None and dt is not None:
-                md_z = self.md_conditioning(
-                    x_t=x_t,
-                    dt=dt,
-                    atom_to_token=atom_to_token,
-                    ref_atom_name_chars=ref_atom_name_chars,
-                    atom_attention_mask=atm_mask,
-                    token_attention_mask=tok_mask,
+            md_z: Tensor | None = None
+            md_z_ca: Tensor | None = None
+            md_z_dt: Tensor | None = None
+            md_s_dt: Tensor | None = None
+            if (
+                x_t is not None
+                and dt is not None
+                and (
+                    md_conditioning_trunk
+                    or md_conditioning_diffusion
+                    or md_conditioning_post_trunk_add
                 )
-                lm_z = md_z if lm_z is None else lm_z + md_z.to(dtype=lm_z.dtype)
+            ):
+                md_z, md_z_ca, md_z_dt, md_s_dt = (
+                    self.md_conditioning.forward_components(
+                        x_t=x_t,
+                        dt=dt,
+                        atom_to_token=atom_to_token,
+                        ref_atom_name_chars=ref_atom_name_chars,
+                        atom_attention_mask=atm_mask,
+                        token_attention_mask=tok_mask,
+                    )
+                )
+                if md_conditioning_trunk:
+                    lm_z = (
+                        md_z
+                        if lm_z is None
+                        else lm_z + md_z.to(dtype=lm_z.dtype)
+                    )
 
             pair_mask = tok_mask[:, :, None].float() * tok_mask[:, None, :].float()
 
@@ -1296,6 +1391,20 @@ class ESMFold2Model(PreTrainedModel):
             z = self.parcae_coda(z, pair_attention_mask=pair_mask)
 
             z = z.float()
+        z_for_diffusion = z
+        if md_conditioning_post_trunk_add:
+            if md_z_ca is None:
+                raise ValueError(
+                    "md_conditioning_post_trunk_add requires x_t and dt"
+                )
+            # The direct late residual is geometric only. Physical dt is routed
+            # separately through the diffusion single representation below.
+            z_for_diffusion = z + md_z_ca.to(device=z.device, dtype=z.dtype)
+        md_s_for_diffusion = (
+            md_s_dt
+            if (md_conditioning_diffusion or md_conditioning_post_trunk_add)
+            else None
+        )
         output: dict[str, Tensor] = {}
         if compute_distogram:
             output["distogram_logits"] = self.distogram_head(z + z.transpose(-2, -3))
@@ -1309,7 +1418,7 @@ class ESMFold2Model(PreTrainedModel):
                     "target_atom_coords and target_atom_mask must be provided together"
                 )
             diffusion_output = self.structure_head.train_denoising(
-                z_trunk=z,
+                z_trunk=z_for_diffusion,
                 s_inputs=x_inputs,
                 s_trunk=None,
                 relative_position_encoding=relative_position_encoding,
@@ -1333,8 +1442,58 @@ class ESMFold2Model(PreTrainedModel):
                 sigma_weighted_denoising_loss=sigma_weighted_denoising_loss,
                 transition_scaled_diffusion=transition_scaled_diffusion,
                 transition_scale=transition_scale,
+                transition_normalized_residual=transition_normalized_residual,
+                transition_reference_scale=transition_reference_scale,
+                transition_center=(
+                    x_t if transition_normalized_residual else None
+                ),
+                transition_center_mask=(
+                    target_atom_mask if transition_normalized_residual else None
+                ),
+                md_pair_conditioning=(
+                    md_z_ca if md_conditioning_diffusion else None
+                ),
+                md_single_conditioning=md_s_for_diffusion,
             )
             output.update(diffusion_output)
+            if md_s_for_diffusion is not None:
+                with torch.no_grad():
+                    dt_single_gain = self.md_conditioning.dt_single_gain().detach().float()
+                    output["md_dt_single_gain"] = dt_single_gain
+                    output["md_dt_single_unscaled_rms"] = (
+                        md_s_for_diffusion.detach().float()
+                        / dt_single_gain.clamp_min(torch.finfo(torch.float32).tiny)
+                    ).square().mean().sqrt()
+            if md_z is not None and md_z_ca is not None and md_z_dt is not None:
+                assert md_z is not None
+                assert md_z_ca is not None
+                assert md_z_dt is not None
+                with torch.no_grad():
+                    pair_mask_f = pair_mask.float()
+                    pair_denom = (
+                        pair_mask_f.sum() * md_z.shape[-1]
+                    ).clamp_min(1.0)
+
+                    def pair_rms(pair: Tensor) -> Tensor:
+                        pair_f = pair.detach().float()
+                        return (
+                            (pair_f.square() * pair_mask_f[..., None]).sum()
+                            / pair_denom
+                        ).sqrt()
+
+                    md_total_rms = pair_rms(md_z)
+                    md_ca_rms = pair_rms(md_z_ca)
+                    z_trunk_rms = pair_rms(z)
+                    output.setdefault("md_conditioning_rms", md_total_rms)
+                    output["md_ca_pair_rms"] = md_ca_rms
+                    output["md_dt_pair_rms"] = pair_rms(md_z_dt)
+                    output.setdefault("diffusion_z_trunk_rms", z_trunk_rms)
+                    if md_conditioning_post_trunk_add:
+                        output["md_conditioning_rms"] = md_ca_rms
+                        output["md_post_trunk_update_rms"] = md_ca_rms
+                        output["md_post_trunk_update_ratio"] = (
+                            md_ca_rms / z_trunk_rms.clamp_min(1e-12)
+                        )
             sample_coords = diffusion_output["sample_atom_coords"]
         else:
             if transition_scaled_diffusion and (
@@ -1349,7 +1508,7 @@ class ESMFold2Model(PreTrainedModel):
                 else self.structure_head.sample
             )
             structure_output = sample_fn(
-                z_trunk=z,
+                z_trunk=z_for_diffusion,
                 s_inputs=x_inputs,
                 s_trunk=None,
                 relative_position_encoding=relative_position_encoding,
@@ -1373,11 +1532,17 @@ class ESMFold2Model(PreTrainedModel):
                 return_sampling_trajectory=return_sampling_trajectory,
                 transition_scaled_diffusion=transition_scaled_diffusion,
                 transition_scale=transition_scale,
+                transition_normalized_residual=transition_normalized_residual,
+                transition_reference_scale=transition_reference_scale,
                 initial_center=x_t if transition_scaled_diffusion else None,
                 initial_center_mask=(
                     x_t_atom_mask if transition_scaled_diffusion else None
                 ),
                 center_inference=center_inference,
+                md_pair_conditioning=(
+                    md_z_ca if md_conditioning_diffusion else None
+                ),
+                md_single_conditioning=md_s_for_diffusion,
             )
 
             sample_coords = structure_output["sample_atom_coords"]
@@ -1453,8 +1618,13 @@ class ESMFold2Model(PreTrainedModel):
         return_sampling_trajectory: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
+        transition_normalized_residual: bool = False,
+        transition_reference_scale: Tensor | float | None = None,
         x_t_atom_mask: Tensor | None = None,
         center_inference: bool = True,
+        md_conditioning_trunk: bool = True,
+        md_conditioning_diffusion: bool = False,
+        md_conditioning_post_trunk_add: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         return self._forward_impl(
@@ -1497,6 +1667,11 @@ class ESMFold2Model(PreTrainedModel):
             return_sampling_trajectory=return_sampling_trajectory,
             transition_scaled_diffusion=transition_scaled_diffusion,
             transition_scale=transition_scale,
+            transition_normalized_residual=transition_normalized_residual,
+            transition_reference_scale=transition_reference_scale,
+            md_conditioning_trunk=md_conditioning_trunk,
+            md_conditioning_diffusion=md_conditioning_diffusion,
+            md_conditioning_post_trunk_add=md_conditioning_post_trunk_add,
             x_t_atom_mask=x_t_atom_mask,
             center_inference=center_inference,
             train_structure=False,
@@ -1539,6 +1714,8 @@ class ESMFold2Model(PreTrainedModel):
         sigma_weighted_denoising_loss: bool = False,
         transition_scaled_diffusion: bool = False,
         transition_scale: Tensor | float | None = None,
+        transition_normalized_residual: bool = False,
+        transition_reference_scale: Tensor | float | None = None,
         num_loops: int | None = None,
         num_diffusion_samples: int | None = 1,
         num_sampling_steps: int | None = None,
@@ -1548,6 +1725,9 @@ class ESMFold2Model(PreTrainedModel):
         msa_column_mask_rate: float = 0.1,
         msa_subsample_at_inference: bool = True,
         compute_distogram: bool = False,
+        md_conditioning_trunk: bool = True,
+        md_conditioning_diffusion: bool = False,
+        md_conditioning_post_trunk_add: bool = False,
         **kwargs,
     ) -> dict[str, Tensor]:
         return self._forward_impl(
@@ -1593,6 +1773,11 @@ class ESMFold2Model(PreTrainedModel):
             sigma_weighted_denoising_loss=sigma_weighted_denoising_loss,
             transition_scaled_diffusion=transition_scaled_diffusion,
             transition_scale=transition_scale,
+            transition_normalized_residual=transition_normalized_residual,
+            transition_reference_scale=transition_reference_scale,
+            md_conditioning_trunk=md_conditioning_trunk,
+            md_conditioning_diffusion=md_conditioning_diffusion,
+            md_conditioning_post_trunk_add=md_conditioning_post_trunk_add,
             compute_distogram=compute_distogram,
             compute_confidence=False,
             train_structure=True,
